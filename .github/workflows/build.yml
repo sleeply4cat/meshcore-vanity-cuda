@@ -6,51 +6,99 @@ on:
     tags: ['v*']            # tag pushes (vX.Y.Z) build + publish a release
   pull_request:
 
-# Needed so the tag build can create a GitHub Release.
+# Needed so the release job can create a GitHub Release.
 permissions:
   contents: write
 
+# Fat-binary codegen targets, shared by the Linux and Windows release builds.
+# (Linux goes through `make release`; keep that list in sync with this one.)
+env:
+  GENCODE: >-
+    -gencode arch=compute_60,code=sm_60
+    -gencode arch=compute_70,code=sm_70
+    -gencode arch=compute_75,code=sm_75
+    -gencode arch=compute_80,code=sm_80
+    -gencode arch=compute_86,code=sm_86
+    -gencode arch=compute_89,code=sm_89
+    -gencode arch=compute_90,code=sm_90
+    -gencode arch=compute_90,code=compute_90
+
 jobs:
-  build:
+  # ---- Compile check on every push / PR (not tags) ------------------------
+  check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    # Official CUDA image ships nvcc. Pin the ubuntu22.04 base so the produced
-    # binary stays portable to older distros (glibc 2.35 host; the code keeps
-    # its highest required symbol at 2.34). No GPU is needed to *compile*.
     container:
       image: nvidia/cuda:12.5.1-devel-ubuntu22.04
     steps:
-      # The CUDA image has no host toolchain / git; add them (git is required by
-      # actions/checkout, build-essential gives gcc/g++/make for nvcc).
       - name: Install build prerequisites
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential git ca-certificates
-
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential git ca-certificates
       - uses: actions/checkout@v4
-
-      # Non-tag pushes / PRs: just make sure it compiles.
       - name: Compile check
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         run: |
           nvcc --version
           make ARCH=sm_86
           ./meshcore-vanity --help
 
-      # Tag builds: portable fat binary (sm_60…sm_90 + PTX fallback).
-      - name: Build portable release binary
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+  # ---- Release builds, tags only ------------------------------------------
+  linux:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    # ubuntu22.04 base keeps the binary portable to older distros (glibc 2.35).
+    container:
+      image: nvidia/cuda:12.5.1-devel-ubuntu22.04
+    steps:
+      - name: Install build prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Build portable binary
         run: |
           nvcc --version
           make release
           ./meshcore-vanity --help
-          tar czf meshcore-vanity-linux-x86_64.tar.gz \
-            meshcore-vanity README.md FAQ.md LICENSE
+          tar czf meshcore-vanity-linux-x86_64.tar.gz meshcore-vanity README.md FAQ.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: meshcore-vanity-linux-x86_64.tar.gz
 
+  windows:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: windows-2022        # VS2022 / MSVC preinstalled
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.5.1'
+          method: 'network'
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Build portable binary
+        shell: cmd
+        run: |
+          nvcc --version
+          nvcc -O3 -Xptxas -O3 --std=c++14 -Xcompiler "/MT" %GENCODE% src\main.cu -o meshcore-vanity.exe
+          meshcore-vanity.exe --help
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path meshcore-vanity.exe,README.md,FAQ.md,LICENSE -DestinationPath meshcore-vanity-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: meshcore-vanity-windows-x86_64.zip
+
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            meshcore-vanity
-            meshcore-vanity-linux-x86_64.tar.gz
+          files: dist/*
           generate_release_notes: true
