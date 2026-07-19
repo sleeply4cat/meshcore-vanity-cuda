@@ -3,6 +3,9 @@
 *.o
 *.obj
 *.env
+*.exe
+*.exp
+*.lib
 
 # Editor / OS cruft
 *.swp
