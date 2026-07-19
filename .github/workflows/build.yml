@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']            # tag pushes (vX.Y.Z) build + publish a release
+  pull_request:
+
+# Needed so the tag build can create a GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Official CUDA image ships nvcc. Pin the ubuntu22.04 base so the produced
+    # binary stays portable to older distros (glibc 2.35 host; the code keeps
+    # its highest required symbol at 2.34). No GPU is needed to *compile*.
+    container:
+      image: nvidia/cuda:12.5.1-devel-ubuntu22.04
+    steps:
+      # The CUDA image has no host toolchain / git; add them (git is required by
+      # actions/checkout, build-essential gives gcc/g++/make for nvcc).
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates
+
+      - uses: actions/checkout@v4
+
+      # Non-tag pushes / PRs: just make sure it compiles.
+      - name: Compile check
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          nvcc --version
+          make ARCH=sm_86
+          ./meshcore-vanity --help
+
+      # Tag builds: portable fat binary (sm_60…sm_90 + PTX fallback).
+      - name: Build portable release binary
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          nvcc --version
+          make release
+          ./meshcore-vanity --help
+          tar czf meshcore-vanity-linux-x86_64.tar.gz \
+            meshcore-vanity README.md FAQ.md LICENSE
+
+      - name: Publish GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            meshcore-vanity
+            meshcore-vanity-linux-x86_64.tar.gz
+          generate_release_notes: true

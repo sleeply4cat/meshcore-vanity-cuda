@@ -1,0 +1,9 @@
+# Build output
+/meshcore-vanity
+*.o
+*.obj
+*.env
+
+# Editor / OS cruft
+*.swp
+.DS_Store
