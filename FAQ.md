@@ -15,21 +15,22 @@ being printed, and the math is cross-validated against libsodium/PyNaCl (see
 
 ### Do I need a GPU? Which one?
 Yes — it's GPU-only, there is no CPU search path. Any NVIDIA GPU with a recent
-driver works. It's tuned for Ampere (sm_86, e.g. RTX 3050/3060), but the
-released binary is a fat binary covering sm_60…sm_90 plus a PTX fallback, so it
-runs on other generations too. Build from source with `make ARCH=sm_XX` for your
-specific card.
+driver works. It's tuned for Ampere (sm_86), but the released binary is a fat
+binary covering sm_60…sm_90 plus a PTX fallback, so it runs on other generations
+too. Build from source with `make ARCH=sm_XX` for your specific card.
 
 ### How fast is it?
-~345 Mkeys/s on an RTX 3050 Laptop at `--window 1024` (vs ~7 Mkeys/s for the old
-OpenCL build). Faster GPUs scale up. Measure over a sustained run — a cold start
-(context init, JIT, boost ramp) roughly halves the first few seconds.
+Hundreds of Mkeys/s on a modern NVIDIA GPU — orders of magnitude faster than a
+naive per-candidate search. Exact throughput depends on your GPU and the
+`--window` setting; measure it by running a search and reading the `Mkeys/s`
+counter after a few seconds of warm-up (a cold start — context init, JIT, boost
+ramp — roughly halves the first few seconds).
 
 ### How long will my prefix take?
 Each hex nibble is 4 bits, so an N-nibble prefix needs ~2^(4N) attempts on
-average. At 345 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈ ~12 s, 10 nibbles ≈
-~50 min, 12 nibbles ≈ ~9 days. The tool prints `Estimated attempts: 2^bits` at
-startup.
+average. As a rough guide at ~300 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
+~15 s, 10 nibbles ≈ ~1 h, 12 nibbles ≈ ~10 days. The tool prints
+`Estimated attempts: 2^bits` at startup.
 
 ### Can I match multiple prefixes, a suffix, or a regex?
 Not currently — one prefix per run. The per-candidate cost is dominated by the
@@ -63,10 +64,18 @@ driver libs instead, e.g.
 `/etc/ld.so.conf.d/000_cuda-compat.conf`.
 
 ### `out of memory` at kernel launch?
-Large windows reserve per-thread local memory across every resident thread. The
-default auto-fits the window to free VRAM and falls back to smaller windows on
-OOM. If it still fails, lower `--blocks` or set `--window 128` (or `64`)
-explicitly.
+Large windows reserve a lot of GPU memory — the driver pins per-thread local
+memory for the SM's full thread capacity (`SM_count × maxThreadsPerSM × W·40`
+bytes), which for big `W` can be several GB. The default auto-fits the window to
+free VRAM and falls back to smaller windows on OOM. If it still fails, lower
+`--blocks` or set a smaller `--window` (e.g. `128` or `64`). Run `--benchmark`
+to see which windows actually fit your GPU (unfitting ones show `OOM/skip`).
+
+### Which `--window` should I use?
+Run `--benchmark`: it times every window (~1s each) and prints the measured
+`Mkeys/s`, the live occupancy, and the memory reserve, ending with the fastest
+one. Gains above ~1024 are hardware-dependent, so measure rather than assume
+bigger is better.
 
 ### Is it safe? Is my private key exposed?
 The private key is generated locally on your machine and only printed to stdout —

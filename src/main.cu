@@ -24,8 +24,13 @@
 // Window = candidates per thread per launch (batch size). It is chosen at
 // runtime (--window, or auto-fit to VRAM); the kernel is templated on it so the
 // per-thread buffers stay compile-time sized. MAXW bounds the precomputed table.
-#define MAXW 1024
-static const int kWindows[] = {1024, 512, 256, 128, 64};  // supported, descending
+#define MAXW 4096
+// Supported windows, descending. The single per-thread buffer (pref) is W*40
+// bytes of local memory, so W=4096 = 160 KB/thread, well under the 512 KB
+// per-thread local limit (num and den are recomputed, not stored).
+// Bigger windows amortize the two per-window inversions over more candidates;
+// pick them explicitly with --window.
+static const int kWindows[] = {4096, 2048, 1024, 512, 256, 128, 64};
 
 #define RESULT_CAP 4096      // max matches recorded per launch
 
@@ -163,27 +168,36 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
     // Candidate i=0 is P0 itself: y = y0.
     check_and_record(y0, start_unit);
 
-    // Candidates i=1..W-1: numerator/denominator per point, then one
-    // shared Montgomery inversion of all denominators.
-    bignum25519 num[W], den[W], pref[W];
+    // Candidates i=1..W-1: build each denominator, one shared Montgomery
+    // inversion of all of them, then divide. ONLY the prefix products are
+    // stored. Both the numerator (num_i = x0*x_i + y0*y_i) and the denominator
+    // (den_i = 1 - K*gp_i) are recomputed in the backward pass from x0,y0,K and
+    // the shared table, so a single W-element buffer holds the whole window
+    // (a third of the original three-buffer footprint). num costs no extra
+    // multiplies (its two just move passes); den costs +1 multiply/candidate
+    // (it is needed in both passes) — a cheap trade for removing another
+    // local-memory store+load stream and for fitting much larger windows.
+    bignum25519 pref[W];
     bignum25519 acc; curve25519_copy(acc, one);
     for (int i = 1; i < W; i++) {
-        bignum25519 a, b, c;
-        curve25519_mul(a, x0, gx[i]);   // x0 * x_i
-        curve25519_mul(b, y0, gy[i]);   // y0 * y_i
-        curve25519_add_reduce(num[i], a, b);           // num = x0 x_i + y0 y_i
+        bignum25519 c, den;
         curve25519_mul(c, K, gp[i]);    // c = d x0 y0 x_i y_i
-        curve25519_sub_reduce(den[i], one, c);         // den = 1 - c
+        curve25519_sub_reduce(den, one, c);            // den = 1 - c
         curve25519_copy(pref[i], acc);                 // prefix product
-        curve25519_mul(acc, acc, den[i]);
+        curve25519_mul(acc, acc, den);
     }
     curve25519_recip(acc, acc);                        // 1 / prod(den)
 
     for (int i = W - 1; i >= 1; i--) {
-        bignum25519 inv, y;
+        bignum25519 a, b, c, den, num, inv, y;
         curve25519_mul(inv, acc, pref[i]);             // 1 / den_i
-        curve25519_mul(acc, acc, den[i]);              // strip den_i
-        curve25519_mul(y, num[i], inv);                // y_i = num_i / den_i
+        curve25519_mul(c, K, gp[i]);                   // recompute den_i:
+        curve25519_sub_reduce(den, one, c);            //   1 - K gp_i
+        curve25519_mul(acc, acc, den);                 // strip den_i
+        curve25519_mul(a, x0, gx[i]);                  // recompute num_i:
+        curve25519_mul(b, y0, gy[i]);                  //   x0 x_i + y0 y_i
+        curve25519_add_reduce(num, a, b);
+        curve25519_mul(y, num, inv);                   // y_i = num_i / den_i
         check_and_record(y, start_unit + (unsigned long long)i);
     }
 }
@@ -315,6 +329,8 @@ static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchAr
 #define LV(W) vanity_kernel<W><<<blocks, tpb>>>(a.base, a.gx, a.gy, a.gp, a.req, a.mask, \
                                                 a.prefix_len, a.count, a.units)
     switch (window) {
+        case 4096: LV(4096); break;
+        case 2048: LV(2048); break;
         case 1024: LV(1024); break;
         case 512:  LV(512);  break;
         case 256:  LV(256);  break;
@@ -326,34 +342,52 @@ static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchAr
     return cudaGetLastError();
 }
 
+// All vanity_kernel<W> share one signature, so a plain const void* pointer lets
+// the runtime introspection helpers (attributes, occupancy) take a single path.
+static const void *vanity_kernel_ptr(int window) {
+    switch (window) {
+        case 4096: return (const void *)vanity_kernel<4096>;
+        case 2048: return (const void *)vanity_kernel<2048>;
+        case 1024: return (const void *)vanity_kernel<1024>;
+        case 512:  return (const void *)vanity_kernel<512>;
+        case 256:  return (const void *)vanity_kernel<256>;
+        case 128:  return (const void *)vanity_kernel<128>;
+        default:   return (const void *)vanity_kernel<64>;
+    }
+}
+
 // Per-thread local memory (bytes) the given window instantiation needs.
 static size_t window_local_bytes(int window) {
     cudaFuncAttributes fa;
-    cudaError_t e;
-    switch (window) {
-        case 1024: e = cudaFuncGetAttributes(&fa, vanity_kernel<1024>); break;
-        case 512:  e = cudaFuncGetAttributes(&fa, vanity_kernel<512>);  break;
-        case 256:  e = cudaFuncGetAttributes(&fa, vanity_kernel<256>);  break;
-        case 128:  e = cudaFuncGetAttributes(&fa, vanity_kernel<128>);  break;
-        default:   e = cudaFuncGetAttributes(&fa, vanity_kernel<64>);   break;
-    }
-    return e == cudaSuccess ? fa.localSizeBytes : (size_t)3 * window * 40;
+    if (cudaFuncGetAttributes(&fa, vanity_kernel_ptr(window)) != cudaSuccess)
+        return (size_t)window * 40;
+    return fa.localSizeBytes;
 }
 
-// Largest supported window whose worst-case local-memory reserve
-// (localBytes * maxResidentThreads) fits in free VRAM with margin.
-static int auto_window(int tpb) {
+// Worst-case per-thread local-memory reserve for a window. This is inherent,
+// documented CUDA behavior (not a bug): the driver provisions a local-memory
+// backing store with a private slot for every thread that could ever be
+// resident, sized by the SM's *absolute* thread capacity (maxThreadsPerSM),
+// independent of the kernel's actual occupancy. Verified two ways: capping a
+// probe kernel's occupancy 100%->33% left the reservation unchanged, and this
+// kernel (register-limited to ~33%) still OOMs window 2048 at the full
+// numSM*maxThreadsPerSM*240KB. The only lever is loc/thr itself, not occupancy.
+static size_t window_reserve_bytes(int window, int numSM, int maxThreadsSM) {
+    return (size_t)numSM * maxThreadsSM * window_local_bytes(window);
+}
+
+// Largest supported window whose local-memory reserve fits free VRAM with a
+// margin.
+static int auto_window() {
     size_t freeB = 0, totalB = 0;
     cudaMemGetInfo(&freeB, &totalB);
     int numSM = 1, maxThreadsSM = 1024, dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
-    for (int w : kWindows) {
-        size_t resident = (size_t)numSM * maxThreadsSM;   // worst case the driver reserves for
-        size_t reserve = resident * window_local_bytes(w);
-        if ((double)reserve < 0.85 * (double)freeB) return w;
-    }
+    for (int w : kWindows)
+        if ((double)window_reserve_bytes(w, numSM, maxThreadsSM) < 0.85 * (double)freeB)
+            return w;
     return kWindows[sizeof(kWindows) / sizeof(kWindows[0]) - 1];  // smallest
 }
 
@@ -367,6 +401,7 @@ static int nearest_window(int req) {
 }
 
 static int run_selftest();
+static int run_benchmark(int blocks, int tpb);
 
 int main(int argc, char **argv) {
     std::string prefix;
@@ -377,6 +412,7 @@ int main(int argc, char **argv) {
     int window = 0;              // 0 = auto-fit to VRAM
     bool progress = true;
     bool selftest = false;
+    bool benchmark = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -385,6 +421,7 @@ int main(int argc, char **argv) {
             return argv[++i];
         };
         if (a == "--selftest") selftest = true;
+        else if (a == "--benchmark" || a == "--bench") benchmark = true;
         else if (a == "-l" || a == "--limit") limit = parse_long(need("--limit"));
         else if (a == "--blocks") blocks = (int)parse_long(need("--blocks"));
         else if (a == "--tpb") tpb = (int)parse_long(need("--tpb"));
@@ -394,13 +431,14 @@ int main(int argc, char **argv) {
         else if (a == "-h" || a == "--help") {
             printf("Usage: %s <HEX_PREFIX> [options]\n"
                    "  -l, --limit N     stop after N matches (0 = infinite) [1]\n"
-                   "  -w, --window N    batch size/thread: 64|128|256|512|1024 [auto-fit VRAM]\n"
+                   "  -w, --window N    batch size/thread: 64|128|256|512|1024|2048|4096 [auto-fit VRAM]\n"
                    "                    bigger = faster but more GPU memory\n"
                    "      --blocks N    CUDA blocks [512]\n"
                    "      --tpb N       threads per block [256]\n"
                    "  -d, --device I    CUDA device index [0]\n"
                    "      --no-progress suppress progress output\n"
-                   "      --selftest    run correctness self-tests and exit\n",
+                   "      --selftest    run correctness self-tests and exit\n"
+                   "      --benchmark   time every window (1s warm-up + 1s each) and exit\n",
                    argv[0]);
             return 0;
         }
@@ -415,6 +453,7 @@ int main(int argc, char **argv) {
     cuda_check(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), "setDeviceFlags");
 
     if (selftest) return run_selftest();
+    if (benchmark) return run_benchmark(blocks, tpb);
 
     if (prefix.empty() || prefix.size() > 64) {
         fprintf(stderr, "Prefix must be 1-64 hex characters. Use --help.\n");
@@ -424,12 +463,13 @@ int main(int argc, char **argv) {
     // Resolve the window: explicit --window (snapped to a supported size) or
     // auto-fit to free VRAM.
     if (window == 0) {
-        window = auto_window(tpb);
-        fprintf(stderr, "Window: auto-selected %d (fits GPU memory)\n", window);
+        window = auto_window();
+        fprintf(stderr, "Window: auto-selected %d (largest that fits; run --benchmark "
+                        "to find the fastest for your GPU)\n", window);
     } else {
         int snap = nearest_window(window);
         if (snap != window)
-            fprintf(stderr, "Window: %d not supported, using %d (supported: 64/128/256/512/1024)\n",
+            fprintf(stderr, "Window: %d not supported, using %d (supported: 64/128/256/512/1024/2048/4096)\n",
                     window, snap);
         window = snap;
     }
@@ -602,4 +642,106 @@ static int run_selftest() {
     printf("[selftest] (compare against reference scalar*B; see README)\n");
 
     return fails == 0 ? 0 : 2;
+}
+
+// -------------------------------------------------------------------------
+// Quick benchmark: time every supported window (~1s warm-up + ~1s measured)
+// and report throughput and the local-memory reserve, so you can pick the
+// fastest --window that fits your GPU.
+// -------------------------------------------------------------------------
+static int run_benchmark(int blocks, int tpb) {
+    using clock = std::chrono::steady_clock;
+
+    int numSM = 1, maxThreadsSM = 1, dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
+
+    // Dummy prefix that essentially never matches (8 bytes, full mask): the
+    // kernel does full work with no result-buffer contention.
+    const int PL = 8;
+    std::vector<uint8_t> req(PL, 0), mask(PL, 0xFF);
+    uint8_t base[32];
+    fill_random(base, 32);
+    clamp_scalar(base);
+    const unsigned long long threads = (unsigned long long)blocks * tpb;
+
+    fprintf(stderr, "Benchmarking grid %d x %d on %d SM...\n", blocks, tpb, numSM);
+    printf("%6s  %10s  %8s  %9s\n", "window", "Mkeys/s", "loc/thr", "reserve");
+
+    double best_mps = 0; int best_w = 0;
+    const int nW = (int)(sizeof(kWindows) / sizeof(kWindows[0]));
+    for (int idx = nW - 1; idx >= 0; idx--) {    // ascending, small windows first
+        int w = kWindows[idx];
+
+        // Each vanity_kernel<W> holds its own local-memory reservation for the
+        // context's lifetime, so measuring several in one context would pile
+        // them up and falsely OOM the big windows. Give each window a fresh
+        // context so its numbers match a real standalone run.
+        cudaDeviceReset();
+        cudaSetDevice(dev);
+        cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+
+        size_t localB = window_local_bytes(w);
+        size_t reserveMB = window_reserve_bytes(w, numSM, maxThreadsSM) >> 20;
+
+        uint8_t *d_base, *d_req, *d_mask;
+        unsigned long long *d_count, *d_units;
+        bignum25519 *d_gx, *d_gy, *d_gp;
+        bool ok =
+            cudaMalloc(&d_base, 32) == cudaSuccess &&
+            cudaMalloc(&d_req, PL) == cudaSuccess &&
+            cudaMalloc(&d_mask, PL) == cudaSuccess &&
+            cudaMalloc(&d_count, sizeof(unsigned long long)) == cudaSuccess &&
+            cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP) == cudaSuccess &&
+            cudaMalloc(&d_gx, sizeof(bignum25519) * w) == cudaSuccess &&
+            cudaMalloc(&d_gy, sizeof(bignum25519) * w) == cudaSuccess &&
+            cudaMalloc(&d_gp, sizeof(bignum25519) * w) == cudaSuccess;
+        if (ok) {
+            cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice);
+            cudaMemcpy(d_req, req.data(), PL, cudaMemcpyHostToDevice);
+            cudaMemcpy(d_mask, mask.data(), PL, cudaMemcpyHostToDevice);
+            cudaMemset(d_count, 0, sizeof(unsigned long long));
+            build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, w);
+            if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); ok = false; }
+        }
+
+        LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, PL, d_count, d_units};
+        unsigned long long per_launch = threads * (unsigned long long)w;
+
+        // Launches until >= target seconds elapse; returns elapsed (or -1 on
+        // error) with the candidate count via out-param.
+        auto run_span = [&](double target, unsigned long long &cand) -> double {
+            cand = 0;
+            auto t0 = clock::now();
+            double el = 0;
+            do {
+                if (launch_vanity(w, blocks, tpb, la) != cudaSuccess) { cudaGetLastError(); return -1; }
+                if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return -1; }
+                cand += per_launch;
+                el = std::chrono::duration<double>(clock::now() - t0).count();
+            } while (el < target);
+            return el;
+        };
+
+        unsigned long long tmp = 0;
+        if (!ok || run_span(1.0, tmp) < 0) {    // warm-up doubles as a fit check
+            printf("%6d  %10s  %6zuKB  %6zuMB\n", w, "OOM/skip", localB >> 10, reserveMB);
+            fflush(stdout);
+            continue;
+        }
+        unsigned long long cand = 0;
+        double el = run_span(1.0, cand);
+        double mps = (el > 0) ? (double)cand / el / 1e6 : 0;
+        printf("%6d  %10.1f  %6zuKB  %6zuMB\n", w, mps, localB >> 10, reserveMB);
+        fflush(stdout);
+        if (mps > best_mps) { best_mps = mps; best_w = w; }
+    }
+
+    cudaDeviceReset();
+    cudaSetDevice(dev);
+    printf("(reserve = worst-case local memory the driver pins = "
+           "SM count x maxThreadsPerSM x loc/thr)\n");
+    if (best_w) printf("Fastest: --window %d  (%.1f Mkeys/s)\n", best_w, best_mps);
+    return 0;
 }

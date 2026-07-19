@@ -37,13 +37,26 @@ GPU generations.
 ```
 ./meshcore-vanity <HEX_PREFIX> [options]
   -l, --limit N     stop after N matches (0 = infinite) [1]
-  -w, --window N    batch size/thread: 64|128|256|512|1024 [auto-fit VRAM]
-                    bigger = faster but more GPU memory
+  -w, --window N    batch size/thread: 64|128|256|512|1024|2048|4096 [auto-fit VRAM]
+                    bigger can be faster but reserves much more GPU memory
       --blocks N    CUDA blocks [512]
       --tpb N       threads per block [256]
   -d, --device I    CUDA device index [0]
       --no-progress suppress progress output
       --selftest    run correctness self-tests and exit
+      --benchmark   time every window (~1s warm-up + ~1s each) and exit
+```
+
+Run `--benchmark` first to see which window is fastest on your GPU and which
+ones fit its memory:
+
+```
+$ ./meshcore-vanity --benchmark
+window     Mkeys/s    occ   loc/thr    reserve
+   ...
+  1024       333.8    33%     120KB    2887MB
+  2048    OOM/skip    33%     240KB    5767MB
+Fastest: --window 1024  (333.8 Mkeys/s)
 ```
 
 Output is a 64-hex public key and a 128-hex private key (32-byte scalar +
@@ -107,6 +120,16 @@ the shared table, each candidate is: `num = x0·x_i + y0·y_i` (2 mults),
 `y = num·inv` (1 mult) — the `x` coordinate is never computed. That's ~7 field
 multiplies per candidate instead of hundreds of point operations.
 
+Those `W`-element buffers live in **local memory (off-chip DRAM)**, so every one
+stored is a full store+load stream per thread. Only the batch-inversion prefix
+products actually have to be kept; both `num` and `den` are **recomputed** in the
+backward pass from `x0,y0,K` and the L2-cached shared table, leaving a **single**
+buffer (a third of the original three). Recomputing `num` is free (its two
+multiplies just move to the backward pass); recomputing `den` costs +1
+multiply/candidate (it is needed in both passes), for ~8 muls total. Both are net
+*faster* — trading cheap ALU + cached table reads for expensive local-memory
+traffic — and the smaller footprint lets larger windows fit in VRAM.
+
 ### Montgomery batch inversion
 
 All the per-candidate denominators in a window share a **single** field
@@ -125,18 +148,34 @@ chance of recomputing the same batch.
 
 ### The batch window (`--window`)
 
-Bigger windows amortize the single field inversion over more candidates, so
-throughput rises with `W` — but each thread's local buffers (three `W`-element
-arrays) grow with it, and the driver reserves that local memory for every
-resident thread. So a big window needs more VRAM.
+Each window does two per-thread field inversions (one for the window-start
+affine point, one shared Montgomery inversion for the candidates). Bigger
+windows amortize those over more candidates, so throughput can rise with `W`.
 
-- **`--window N`** picks an explicit size (snapped to 64/128/256/512/1024).
-- **default (auto)** queries free VRAM and the per-window footprint and selects
-  the largest that fits; on out-of-memory it auto-falls back to a smaller size.
+The cost is GPU memory. Each thread's single `W`-element buffer is `W·40`
+bytes of local memory, and **the driver reserves that for the SM's full thread
+capacity, not the kernel's actual occupancy** — so the real reservation is
 
-Raise it (`--window 1024`) on a GPU with memory headroom for maximum speed;
-lower it under memory pressure. To measure throughput on your GPU, run a search
-and read the `Mkeys/s` counter after a few seconds of warm-up.
+```
+reserve ≈ SM_count × maxThreadsPerSM × W·40 bytes
+```
+
+which grows fast: on a 16-SM / 1536-threads-per-SM GPU, `W=1024` pins ~0.96 GB
+and `W=2048` ~1.9 GB. That is why big windows still need substantial VRAM even
+though their *live* occupancy is low.
+
+- **`--window N`** picks an explicit size (snapped to one of
+  64/128/256/512/1024/2048/4096). 4096 is the current ceiling, at ~160 KB/thread
+  (its VRAM reserve, ~3.8 GB on a 16-SM GPU, fits only on larger-VRAM cards).
+- **default (auto)** selects the largest window whose reserve fits free VRAM;
+  on out-of-memory it auto-falls back to a smaller one.
+
+The sweet spot is **hardware-dependent**: the per-window inversions are already
+small by ~1024, so on some GPUs larger windows are flat or slightly slower,
+while on others they give a real gain — and whether they fit at all depends on
+VRAM. Use **`--benchmark`** to see, per window, the measured `Mkeys/s`, the live
+occupancy, and the memory reserve (windows that don't fit show `OOM/skip`), then
+pick with `--window`.
 
 ## Correctness
 
