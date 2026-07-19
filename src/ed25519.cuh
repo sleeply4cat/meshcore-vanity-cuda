@@ -10,7 +10,16 @@
 #include <cstddef>
 
 // ===== types / structs / curve constants =====
-#define ALIGN(x) __attribute__((aligned(x)))
+#if defined(_MSC_VER)
+    #define ALIGN(x) __declspec(align(x))
+#else
+    #define ALIGN(x) __attribute__((aligned(x)))
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define __builtin_popcount __popcnt
+#endif
 
 typedef uint32_t bignum25519[10];
 typedef uint32_t bignum25519align16[12];
@@ -95,8 +104,6 @@ __constant__ ge25519_niels ALIGN(16) ge25519_niels_sliding_multiples[32] = {
 };
 
 // ===== ge25519_niels_base_multiples[256][96] =====
-
-#define ALIGN(x) __attribute__((aligned(x)))
 
 /* multiples of the base point in packed {ysubx, xaddy, t2d} form */
 __constant__ uint8_t ALIGN(16) ge25519_niels_base_multiples[256][96] = {
@@ -364,7 +371,6 @@ __constant__ uint8_t ALIGN(16) ge25519_niels_base_multiples[256][96] = {
 
 #define mul32x32_64(a,b) (((uint64_t)(a))*(b))
 #define DONNA_NOINLINE __attribute__((noinline))
-#define ALIGN(x) __attribute__((aligned(x)))
 #define ROTL32(a,b) (((a) << (b)) | ((a) >> (32 - b)))
 
 typedef unsigned char curved25519_key[32];
