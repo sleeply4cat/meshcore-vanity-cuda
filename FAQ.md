@@ -71,11 +71,11 @@ free VRAM and falls back to smaller windows on OOM. If it still fails, lower
 `--blocks` or set a smaller `--window` (e.g. `128` or `64`). Run `--benchmark`
 to see which windows actually fit your GPU (unfitting ones show `OOM/skip`).
 
-### Which `--window` should I use?
-Run `--benchmark`: it times every window (~1s each) and prints the measured
-`Mkeys/s`, the live occupancy, and the memory reserve, ending with the fastest
-one. Gains above ~1024 are hardware-dependent, so measure rather than assume
-bigger is better.
+### Which `--window` (and `--tpb`) should I use?
+Run `--benchmark`: it times every window that fits (~1s each) with the memory
+reserve, then sweeps the block size at the fastest window and prints the exact
+`--window`/`--tpb` to use. Gains above ~1024 are hardware-dependent, so measure
+rather than assume bigger is better.
 
 ### Is it safe? Is my private key exposed?
 The private key is generated locally on your machine and only printed to stdout —

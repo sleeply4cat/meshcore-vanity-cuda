@@ -37,26 +37,31 @@ GPU generations.
 ```
 ./meshcore-vanity <HEX_PREFIX> [options]
   -l, --limit N     stop after N matches (0 = infinite) [1]
-  -w, --window N    batch size/thread: 64|128|256|512|1024|2048|4096 [auto-fit VRAM]
+  -w, --window N    batch/thread: 64|128|256|512|1024|2048|4096|8192 [auto-fit VRAM]
                     bigger can be faster but reserves much more GPU memory
       --blocks N    CUDA blocks [512]
       --tpb N       threads per block [256]
   -d, --device I    CUDA device index [0]
       --no-progress suppress progress output
       --selftest    run correctness self-tests and exit
-      --benchmark   time every window (~1s warm-up + ~1s each) and exit
+      --benchmark   sweep window + block size, print the fastest, and exit
 ```
 
-Run `--benchmark` first to see which window is fastest on your GPU and which
-ones fit its memory:
+Run `--benchmark` first: it sweeps every window that fits your GPU, then sweeps
+the block size at the fastest one, and prints the config to use:
 
 ```
 $ ./meshcore-vanity --benchmark
-window     Mkeys/s    occ   loc/thr    reserve
-   ...
-  1024       333.8    33%     120KB    2887MB
-  2048    OOM/skip    33%     240KB    5767MB
-Fastest: --window 1024  (333.8 Mkeys/s)
+window     Mkeys/s   loc/thr    reserve
+  1024        438.5     40KB     967MB
+  2048        454.9     80KB    1927MB
+  4096     OOM/skip    160KB    3847MB
+...
+Block-size sweep at --window 2048:
+   tpb     Mkeys/s
+   256        454.6
+   512        464.3
+Fastest: --window 2048 --tpb 512  (464.3 Mkeys/s)
 ```
 
 Output is a 64-hex public key and a 128-hex private key (32-byte scalar +
@@ -165,17 +170,18 @@ and `W=2048` ~1.9 GB. That is why big windows still need substantial VRAM even
 though their *live* occupancy is low.
 
 - **`--window N`** picks an explicit size (snapped to one of
-  64/128/256/512/1024/2048/4096). 4096 is the current ceiling, at ~160 KB/thread
-  (its VRAM reserve, ~3.8 GB on a 16-SM GPU, fits only on larger-VRAM cards).
+  64/128/256/512/1024/2048/4096/8192). 8192 is the ceiling, at ~320 KB/thread
+  (under the 512 KB local limit); its ~7.7 GB reserve on a 16-SM GPU fits only on
+  8 GB+ cards, so on most GPUs the practical top is 2048–4096.
 - **default (auto)** selects the largest window whose reserve fits free VRAM;
   on out-of-memory it auto-falls back to a smaller one.
 
 The sweet spot is **hardware-dependent**: the per-window inversions are already
 small by ~1024, so on some GPUs larger windows are flat or slightly slower,
 while on others they give a real gain — and whether they fit at all depends on
-VRAM. Use **`--benchmark`** to see, per window, the measured `Mkeys/s`, the live
-occupancy, and the memory reserve (windows that don't fit show `OOM/skip`), then
-pick with `--window`.
+VRAM. Use **`--benchmark`**: it measures `Mkeys/s` and the memory reserve for
+every window (unfitting ones show `OOM/skip`), then sweeps the block size at the
+fastest window and prints the `--window`/`--tpb` to use.
 
 ## Correctness
 
