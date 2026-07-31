@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
+#include <algorithm>
 #include <random>
 #include <chrono>
 
@@ -113,6 +115,60 @@ __global__ void build_step_table_kernel(bignum25519 *gx, bignum25519 *gy, bignum
 }
 
 // -------------------------------------------------------------------------
+// Low 8 bytes of the compressed encoding of a field element, as one uint64.
+//
+// The filter only ever looks at the first bytes of the key and the encoding is
+// little-endian, so packing all 32 bytes per candidate is waste. The
+// *reduction* cannot be shortened — radix 2^25.5 folds the top of the value
+// back into limb 0 via 2^255 == 19, so the low bits genuinely depend on every
+// limb — but the packing can: after the same canonicalisation
+// curve25519_contract performs, limbs 0..2 cover bits 0..76, and bits 0..63 are
+// exactly f0 | f1<<26 | f2<<51.
+//
+// This mirrors curve25519_contract's reduction; --selftest cross-checks the two
+// against each other on random and edge-case inputs so they cannot drift apart.
+// -------------------------------------------------------------------------
+__device__ static uint64_t curve25519_contract_lo64(const bignum25519 in) {
+    bignum25519 f;
+    curve25519_copy(f, in);
+
+#define LO64_CARRY() \
+    f[1] += f[0] >> 26; f[0] &= reduce_mask_26; \
+    f[2] += f[1] >> 25; f[1] &= reduce_mask_25; \
+    f[3] += f[2] >> 26; f[2] &= reduce_mask_26; \
+    f[4] += f[3] >> 25; f[3] &= reduce_mask_25; \
+    f[5] += f[4] >> 26; f[4] &= reduce_mask_26; \
+    f[6] += f[5] >> 25; f[5] &= reduce_mask_25; \
+    f[7] += f[6] >> 26; f[6] &= reduce_mask_26; \
+    f[8] += f[7] >> 25; f[7] &= reduce_mask_25; \
+    f[9] += f[8] >> 26; f[8] &= reduce_mask_26;
+#define LO64_CARRY_FULL() LO64_CARRY() f[0] += 19 * (f[9] >> 25); f[9] &= reduce_mask_25;
+
+    LO64_CARRY_FULL()
+    LO64_CARRY_FULL()
+    // Now 0 <= f < 2^255. Offset by 19 to separate the two canonical cases,
+    // add 2^255, carry, and drop the borrow — exactly as curve25519_contract.
+    f[0] += 19;
+    LO64_CARRY_FULL()
+    f[0] += (reduce_mask_26 + 1) - 19;
+    f[1] += (reduce_mask_25 + 1) - 1;
+    f[2] += (reduce_mask_26 + 1) - 1;
+    f[3] += (reduce_mask_25 + 1) - 1;
+    f[4] += (reduce_mask_26 + 1) - 1;
+    f[5] += (reduce_mask_25 + 1) - 1;
+    f[6] += (reduce_mask_26 + 1) - 1;
+    f[7] += (reduce_mask_25 + 1) - 1;
+    f[8] += (reduce_mask_26 + 1) - 1;
+    f[9] += (reduce_mask_25 + 1) - 1;
+    LO64_CARRY()
+    // (f[9] is masked off in contract here; bits >= 255 do not reach the low 64.)
+#undef LO64_CARRY_FULL
+#undef LO64_CARRY
+
+    return (uint64_t)f[0] | ((uint64_t)f[1] << 26) | ((uint64_t)f[2] << 51);
+}
+
+// -------------------------------------------------------------------------
 // Main search kernel — affine batched-addition walk in +/-i pairs (y only).
 //
 // For candidate i (scalar s0 + i*8) the point is P0 + i*D. Using the complete
@@ -157,9 +213,16 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
     // and no-overlap analysis) is exactly as before.
     const unsigned long long centre_unit = gid * (unsigned long long)W + (unsigned long long)H;
 
-    // Cache the small prefix (<=32 bytes).
-    uint8_t lreq[32], lmask[32];
-    for (int i = 0; i < prefix_len; i++) { lreq[i] = req[i]; lmask[i] = mask[i]; }
+    // Pack the first (up to) 8 prefix bytes into one masked 64-bit comparison.
+    // Keeping them as byte arrays would cost a dynamically indexed register
+    // array in the innermost loop, which nvcc lowers to a select chain — worth
+    // ~5% of total throughput. Longer prefixes fall back to a byte compare that
+    // only a 1-in-2^64 candidate ever reaches.
+    uint64_t req8 = 0, mask8 = 0;
+    for (int i = 0; i < 8 && i < prefix_len; i++) {
+        req8  |= (uint64_t)req[i]  << (8 * i);
+        mask8 |= (uint64_t)mask[i] << (8 * i);
+    }
 
     // Window centre scalar = base + centre_unit*8, then its affine point.
     uint8_t s0[32];
@@ -179,12 +242,15 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
     bignum25519 one; for (int k = 0; k < 10; k++) one[k] = 0; one[0] = 1;
 
     auto check_and_record = [&](const bignum25519 y, unsigned long long unit) {
-        unsigned char pub[32];
-        curve25519_contract(pub, y);
         // Matches the low 255 bits of y (bit 255 = x parity is ignored; the
         // host recomputes the full compressed key for any hit).
-        for (int i = 0; i < prefix_len; i++)
-            if ((pub[i] & lmask[i]) != lreq[i]) return;
+        if ((curve25519_contract_lo64(y) ^ req8) & mask8) return;
+        if (prefix_len > 8) {                          // effectively never taken
+            unsigned char pub[32];
+            curve25519_contract(pub, y);
+            for (int i = 8; i < prefix_len; i++)
+                if ((pub[i] & mask[i]) != req[i]) return;
+        }
         unsigned long long slot = atomicAdd(out_count, 1ULL);
         if (slot < RESULT_CAP) out_units[slot] = unit;
     };
@@ -245,6 +311,17 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
 // Host-callable single-key pack: full compressed pubkey (incl. parity) for a
 // given clamped scalar. Used to verify/display hits.
 // -------------------------------------------------------------------------
+// Selftest helper: contract both ways so the host can check that the fast
+// low-64-bit packing agrees with donna's full 32-byte contract.
+__global__ void contract_lo64_kernel(const bignum25519 *__restrict__ in, int n,
+                                     uint8_t *__restrict__ out32,
+                                     unsigned long long *__restrict__ out_lo) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    curve25519_contract(out32 + i * 32, in[i]);
+    out_lo[i] = curve25519_contract_lo64(in[i]);
+}
+
 __global__ void pack_one_kernel(const uint8_t *__restrict__ scalar, uint8_t *__restrict__ pub) {
     ge25519 P;
     scalar_to_point(&P, scalar);
@@ -660,6 +737,110 @@ done:
 }
 
 // -------------------------------------------------------------------------
+// Self-test: the fast low-64-bit packing must agree with donna's full contract
+// on random field elements plus the canonicalisation edge cases (0, 1, p-1, p,
+// p+1, 2^255-1), which is where a hand-rolled reduction would go wrong.
+// -------------------------------------------------------------------------
+static int check_contract_lo64() {
+    const uint32_t m26 = (1u << 26) - 1, m25 = (1u << 25) - 1;
+    std::vector<std::array<uint32_t, 10>> v;
+    auto push = [&](std::array<uint32_t, 10> f) { v.push_back(f); };
+    auto full = [&](uint32_t lo0) {   // limb0 = lo0, all higher limbs saturated
+        std::array<uint32_t, 10> f{};
+        f[0] = lo0;
+        for (int k = 1; k < 10; k++) f[k] = (k & 1) ? m25 : m26;
+        return f;
+    };
+    push({0,0,0,0,0,0,0,0,0,0});
+    push({1,0,0,0,0,0,0,0,0,0});
+    push(full(m26 - 20));             // p - 1
+    push(full(m26 - 19));             // p     -> must canonicalise to 0
+    push(full(m26 - 18));             // p + 1 -> 1
+    push(full(m26));                  // 2^255 - 1
+    std::mt19937 rng(12345);
+    for (int i = 0; i < 4096; i++) {
+        std::array<uint32_t, 10> f{};
+        for (int k = 0; k < 10; k++) f[k] = rng() & ((k & 1) ? m25 : m26);
+        push(f);
+    }
+
+    const int n = (int)v.size();
+    uint32_t *d_in; uint8_t *d_out32; unsigned long long *d_lo;
+    cuda_check(cudaMalloc(&d_in, sizeof(uint32_t) * 10 * n), "malloc lo64 in");
+    cuda_check(cudaMalloc(&d_out32, 32 * n), "malloc lo64 out32");
+    cuda_check(cudaMalloc(&d_lo, sizeof(unsigned long long) * n), "malloc lo64 lo");
+    cuda_check(cudaMemcpy(d_in, v.data(), sizeof(uint32_t) * 10 * n, cudaMemcpyHostToDevice), "memcpy lo64");
+    contract_lo64_kernel<<<(n + 127) / 128, 128>>>((const bignum25519 *)d_in, n, d_out32, d_lo);
+    cuda_check(cudaGetLastError(), "lo64 launch");
+    cuda_check(cudaDeviceSynchronize(), "lo64 sync");
+
+    std::vector<uint8_t> out32(32 * n);
+    std::vector<unsigned long long> lo(n);
+    cuda_check(cudaMemcpy(out32.data(), d_out32, 32 * n, cudaMemcpyDeviceToHost), "copy out32");
+    cuda_check(cudaMemcpy(lo.data(), d_lo, sizeof(unsigned long long) * n, cudaMemcpyDeviceToHost), "copy lo");
+    cudaFree(d_in); cudaFree(d_out32); cudaFree(d_lo);
+
+    int fails = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned long long want = 0;
+        for (int b = 0; b < 8; b++) want |= (unsigned long long)out32[i * 32 + b] << (8 * b);
+        if (want != lo[i]) fails++;
+    }
+    printf("[selftest] contract_lo64 == low 8 bytes of contract: %d/%d ok\n", n - fails, n);
+    return fails;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: window coverage. Run the real search kernel with prefix_len = 0,
+// so every candidate "matches" and out_units becomes the exact set of units the
+// window walked. It must be precisely [0, blocks*tpb*W) — no gap, no repeat, no
+// overrun into the neighbouring thread's span. This is what guards the +/-i
+// walk, whose failure mode is silently losing or duplicating candidates rather
+// than producing wrong keys.
+// -------------------------------------------------------------------------
+static int check_window_coverage(int window, int blocks, int tpb) {
+    const unsigned long long expect = (unsigned long long)blocks * tpb * window;
+    if (expect > RESULT_CAP) { printf("[selftest] coverage W=%d skipped (too many units)\n", window); return 0; }
+
+    uint8_t base[32]; fill_random(base, 32); clamp_scalar(base);
+    uint8_t *d_base, *d_req;
+    unsigned long long *d_count, *d_units;
+    bignum25519 *d_gx, *d_gy, *d_gp;
+    const size_t tbl = (size_t)(window / 2) + 1;
+    cuda_check(cudaMalloc(&d_base, 32), "cov malloc base");
+    cuda_check(cudaMalloc(&d_req, 1), "cov malloc req");
+    cuda_check(cudaMalloc(&d_count, sizeof(unsigned long long)), "cov malloc count");
+    cuda_check(cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP), "cov malloc units");
+    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * tbl), "cov malloc gx");
+    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * tbl), "cov malloc gy");
+    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * tbl), "cov malloc gp");
+    cuda_check(cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice), "cov memcpy base");
+    cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "cov memset");
+    build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
+    cuda_check(cudaDeviceSynchronize(), "cov table");
+
+    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_req, 0, d_count, d_units};
+    cuda_check(launch_vanity(window, blocks, tpb, la), "cov launch");
+    cuda_check(cudaDeviceSynchronize(), "cov sync");
+
+    unsigned long long count = 0;
+    cuda_check(cudaMemcpy(&count, d_count, sizeof(count), cudaMemcpyDeviceToHost), "cov count");
+    std::vector<unsigned long long> units(count < RESULT_CAP ? count : RESULT_CAP);
+    if (!units.empty())
+        cuda_check(cudaMemcpy(units.data(), d_units, sizeof(unsigned long long) * units.size(),
+                              cudaMemcpyDeviceToHost), "cov units");
+    cudaFree(d_base); cudaFree(d_req); cudaFree(d_count); cudaFree(d_units);
+    cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
+
+    std::sort(units.begin(), units.end());
+    bool ok = (count == expect) && (units.size() == expect);
+    for (unsigned long long i = 0; ok && i < expect; i++) if (units[i] != i) ok = false;
+    printf("[selftest] window %5d coverage (%d x %d threads): %s (%llu/%llu units)\n",
+           window, blocks, tpb, ok ? "exact" : "BROKEN", count, expect);
+    return ok ? 0 : 1;
+}
+
+// -------------------------------------------------------------------------
 // Self-tests: incremental identity on device + a fixed known-answer vector.
 // -------------------------------------------------------------------------
 static int run_selftest() {
@@ -697,6 +878,13 @@ static int run_selftest() {
     printf("[selftest] KAT scalar    = %s\n", hex_upper(kat_scalar, 32).c_str());
     printf("[selftest] KAT pubkey    = %s\n", hex_upper(pub0, 32).c_str());
     printf("[selftest] (compare against reference scalar*B; see README)\n");
+
+    fails += check_contract_lo64();
+    // A power-of-two window, a "half" window, and >1 thread so the boundary
+    // between neighbouring spans is actually exercised.
+    fails += check_window_coverage(64, 2, 2);
+    fails += check_window_coverage(1024, 1, 2);
+    fails += check_window_coverage(1536, 1, 2);
 
     return fails == 0 ? 0 : 2;
 }

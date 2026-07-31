@@ -53,17 +53,18 @@ the block size over the top two windows, and prints the config to use:
 ```
 $ ./meshcore-vanity --benchmark
 window     Mkeys/s   loc/thr    reserve
-  3072        620.0     60KB    1448MB
-  4096        601.3     80KB    1928MB
-  6144        627.9    120KB    2888MB
-  8192     OOM/skip    160KB    3848MB
+  3072        688.3     60KB    1447MB
+  4096        689.5     80KB    1927MB
+  6144        700.4    120KB    2887MB
+  8192     OOM/skip    160KB    3847MB
 ...
 Grid sweep (top windows x block size):
   window     tpb     Mkeys/s
-    6144     128       651.4
-    6144     256       626.5
+    6144     128       697.5
+    6144     256       690.4
+    6144     384       703.1
     6144     512        skip      <- 160 regs/thread x 512 > 64K regs/block
-Fastest: --window 6144 --tpb 128  (651.4 Mkeys/s)
+Fastest: --window 6144 --tpb 384  (703.1 Mkeys/s)
 ```
 
 (The top two windows are swept because the per-block register limit can bar a
@@ -167,6 +168,20 @@ L2-cached shared table. That leaves a single `W/2`-element buffer for a
 pair, and is net *faster* — cheap ALU and cached table reads in exchange for
 expensive local-memory traffic.
 
+### Checking the prefix without packing the key
+
+Every candidate has to be filtered, so the filter itself is on the hot path. Two
+things make it nearly free. The encoding is little-endian, so the prefix lives in
+the **low** bytes: after the same canonical reduction `contract` performs (which
+cannot be skipped — radix 2²⁵·⁵ folds the top of the value back into limb 0 via
+`2²⁵⁵ ≡ 19`, so the low bits depend on every limb), the low 8 bytes are just
+`f0 | f1<<26 | f2<<51`, and the other 24 bytes are never assembled. And the
+prefix itself is packed host-side into one `req`/`mask` pair of 64-bit words, so
+the test is a single `(y ^ req) & mask` instead of a loop over a dynamically
+indexed byte array — which nvcc lowers to a select chain. Together that is worth
+~8% of total throughput. Prefixes longer than 8 bytes fall back to the byte
+compare, on a path only a 1-in-2⁶⁴ candidate ever reaches.
+
 ### Montgomery batch inversion
 
 All the denominators in a window share a **single** field inversion
@@ -239,10 +254,21 @@ best block size non-obvious.
    pubkey CFE058A4A189EE7230E43A1347EA1A7EEF01F3557991A7FD3CEC8915FD290AEC
    ```
 
-The affine `y`-only formula in the search kernel is validated end-to-end: every
-hit is independently re-derived on the host via the *projective* `scalarmult`
-path and prefix-checked before being printed, so a wrong affine result could
-never produce output.
+3. **Fast filter vs. reference packing** — the low-64-bit fast path must agree
+   with donna's full 32-byte `contract` on 4096 random field elements plus the
+   canonicalisation edge cases (`0`, `1`, `p−1`, `p`, `p+1`, `2²⁵⁵−1`).
+4. **Window coverage** — the real search kernel is run with an empty prefix, so
+   every candidate reports itself and the recorded set is the exact set of
+   scalars the window walked. It must be precisely `[0, threads·W)`: no gap, no
+   duplicate, no overrun into the neighbouring thread's span. This is what
+   guards the ±i walk, whose failure mode is silently losing or repeating
+   candidates rather than producing wrong keys. Checked for a power-of-two
+   window, a "half" window, and more than one thread.
+
+The affine `y`-only formula in the search kernel is validated end-to-end too:
+every hit is independently re-derived on the host via the *projective*
+`scalarmult` path and prefix-checked before being printed, so a wrong affine
+result could never produce output.
 
 ## Layout
 

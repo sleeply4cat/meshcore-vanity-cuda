@@ -3,7 +3,7 @@
 ### What does this do?
 It brute-forces MeshCore Ed25519 keypairs on the GPU until the public key starts
 with a hex prefix you choose (a "vanity" key). It's a from-scratch CUDA rewrite
-of the OpenCL `nano-vanity`/MeshCore fork, ~90× faster on the same GPU.
+of the OpenCL `nano-vanity`/MeshCore fork, ~100× faster on the same GPU.
 
 ### Are the keys real MeshCore keys?
 Yes. The output is exactly the MeshCore format: a 64-hex public key and a
@@ -28,8 +28,8 @@ ramp — roughly halves the first few seconds).
 
 ### How long will my prefix take?
 Each hex nibble is 4 bits, so an N-nibble prefix needs ~2^(4N) attempts on
-average. As a rough guide at ~600 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
-~7 s, 10 nibbles ≈ ~30 min, 12 nibbles ≈ ~5 days. The tool prints
+average. As a rough guide at ~700 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
+~6 s, 10 nibbles ≈ ~25 min, 12 nibbles ≈ ~4.5 days. The tool prints
 `Estimated attempts: 2^bits` at startup.
 
 ### Can I match multiple prefixes, a suffix, or a regex?
