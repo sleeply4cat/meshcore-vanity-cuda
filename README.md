@@ -37,7 +37,7 @@ GPU generations.
 ```
 ./meshcore-vanity <HEX_PREFIX> [options]
   -l, --limit N     stop after N matches (0 = infinite) [1]
-  -w, --window N    batch/thread: 64|128|256|512|1024|2048|4096|8192 [auto-fit VRAM]
+  -w, --window N    batch/thread: 64…16384 (see below) [auto-fit VRAM]
                     bigger can be faster but reserves much more GPU memory
       --blocks N    CUDA blocks [512]
       --tpb N       threads per block [256]
@@ -48,21 +48,28 @@ GPU generations.
 ```
 
 Run `--benchmark` first: it sweeps every window that fits your GPU, then sweeps
-the block size at the fastest one, and prints the config to use:
+the block size over the top two windows, and prints the config to use:
 
 ```
 $ ./meshcore-vanity --benchmark
 window     Mkeys/s   loc/thr    reserve
-  1024        438.5     40KB     967MB
-  2048        454.9     80KB    1927MB
-  4096     OOM/skip    160KB    3847MB
+  3072        620.0     60KB    1448MB
+  4096        601.3     80KB    1928MB
+  6144        627.9    120KB    2888MB
+  8192     OOM/skip    160KB    3848MB
 ...
-Block-size sweep at --window 2048:
-   tpb     Mkeys/s
-   256        454.6
-   512        464.3
-Fastest: --window 2048 --tpb 512  (464.3 Mkeys/s)
+Grid sweep (top windows x block size):
+  window     tpb     Mkeys/s
+    6144     128       651.4
+    6144     256       626.5
+    6144     512        skip      <- 160 regs/thread x 512 > 64K regs/block
+Fastest: --window 6144 --tpb 128  (651.4 Mkeys/s)
 ```
+
+(The top two windows are swept because the per-block register limit can bar a
+large `tpb` on the biggest window while a slightly smaller one still allows it.
+The block size is not monotone either: resident threads per SM move in steps, so
+128 and 384 can both beat 256.)
 
 Output is a 64-hex public key and a 128-hex private key (32-byte scalar +
 32-byte random signing component), matching the MeshCore format.
@@ -125,31 +132,59 @@ the shared table, each candidate is: `num = x0·x_i + y0·y_i` (2 mults),
 `y = num·inv` (1 mult) — the `x` coordinate is never computed. That's ~7 field
 multiplies per candidate instead of hundreds of point operations.
 
-Those `W`-element buffers live in **local memory (off-chip DRAM)**, so every one
-stored is a full store+load stream per thread. Only the batch-inversion prefix
-products actually have to be kept; both `num` and `den` are **recomputed** in the
-backward pass from `x0,y0,K` and the L2-cached shared table, leaving a **single**
-buffer (a third of the original three). Recomputing `num` is free (its two
-multiplies just move to the backward pass); recomputing `den` costs +1
-multiply/candidate (it is needed in both passes), for ~8 muls total. Both are net
-*faster* — trading cheap ALU + cached table reads for expensive local-memory
-traffic — and the smaller footprint lets larger windows fit in VRAM.
+### Walking the window in ±i pairs
+
+Negating an Edwards point flips only `x`: `−Q = (−x, y)`. So one table entry
+`i·D` serves **two** candidates at once if the thread's window is walked
+outwards from its centre instead of forwards from its start. Writing
+`A = x0·x_i`, `B = y0·y_i` and `C = K·P_i` (three mults, shared by the pair):
+
+```
+centre + 8i:   y = (B + A) / (1 − C)
+centre − 8i:   y = (B − A) / (1 + C)
+```
+
+The two denominators then collapse into **one** batch-inversion slot, because
+
+```
+(1 − C)·(1 + C) = 1 − C²          — a single squaring
+```
+
+and the joint inverse is split back apart with two mults
+(`1/(1−C) = (1+C)·inv`, and symmetrically). Per pair that is ~10 mults + 2
+squarings — about **5.5 mults per candidate instead of 8** — and it halves both
+the per-thread buffer and the precomputed table, which is what lets much larger
+windows fit in VRAM.
+
+### Recompute instead of store
+
+The per-window buffer lives in **local memory (off-chip DRAM)**, so anything
+stored there is a full store+load stream per thread. Only the batch-inversion
+prefix products actually have to be kept: `C`, both denominators and both
+numerators are **recomputed** in the backward pass from `x0,y0,K` and the
+L2-cached shared table. That leaves a single `W/2`-element buffer for a
+`W`-candidate window. Recomputing costs one extra mult + one extra squaring per
+pair, and is net *faster* — cheap ALU and cached table reads in exchange for
+expensive local-memory traffic.
 
 ### Montgomery batch inversion
 
-All the per-candidate denominators in a window share a **single** field
-inversion (Montgomery's trick: a forward pass of prefix products, one inversion,
-a backward pass), which is what makes the affine walk cheap. This is the standard
+All the denominators in a window share a **single** field inversion
+(Montgomery's trick: a forward pass of prefix products, one inversion, a backward
+pass), which is what makes the affine walk cheap. Thanks to the ±i pairing the
+batch has only `W/2` slots for `W` candidates. This is the standard
 high-throughput layout used by GPU key searchers.
 
 ### No repeated work across launches
 
 Thread `g` owns candidates `s = base + (g·W + j)·8`, `j ∈ [0,W)` — disjoint by
-construction within a launch. Between launches the host advances the `base`
-counter by exactly the span it just covered (`base += T·W·8`, `T` = total
-threads), so launches cover contiguous, non-overlapping intervals. The base
-starts from a fresh random value each run; there is no re-rolling and thus no
-chance of recomputing the same batch.
+construction within a launch. (It walks that span outwards from the middle, but
+the span itself is unchanged; the `+i` half stops one short of the neighbour's
+first unit.) Between launches the host advances the `base` counter by exactly
+the span it just covered (`base += T·W·8`, `T` = total threads), so launches
+cover contiguous, non-overlapping intervals. The base starts from a fresh random
+value each run; there is no re-rolling and thus no chance of recomputing the
+same batch.
 
 ### The batch window (`--window`)
 
@@ -157,22 +192,25 @@ Each window does two per-thread field inversions (one for the window-start
 affine point, one shared Montgomery inversion for the candidates). Bigger
 windows amortize those over more candidates, so throughput can rise with `W`.
 
-The cost is GPU memory. Each thread's single `W`-element buffer is `W·40`
-bytes of local memory, and **the driver reserves that for the SM's full thread
-capacity, not the kernel's actual occupancy** — so the real reservation is
+The cost is GPU memory. Each thread's single buffer holds one prefix product per
+±i **pair**, i.e. `W/2` field elements = `W·20` bytes of local memory, and **the
+driver reserves that for the SM's full thread capacity, not the kernel's actual
+occupancy** — so the real reservation is
 
 ```
-reserve ≈ SM_count × maxThreadsPerSM × W·40 bytes
+reserve ≈ SM_count × maxThreadsPerSM × W·20 bytes
 ```
 
-which grows fast: on a 16-SM / 1536-threads-per-SM GPU, `W=1024` pins ~0.96 GB
-and `W=2048` ~1.9 GB. That is why big windows still need substantial VRAM even
+which grows fast: on a 16-SM / 1536-threads-per-SM GPU, `W=2048` pins ~0.95 GB
+and `W=6144` ~2.8 GB. That is why big windows still need substantial VRAM even
 though their *live* occupancy is low.
 
-- **`--window N`** picks an explicit size (snapped to one of
-  64/128/256/512/1024/2048/4096/8192). 8192 is the ceiling, at ~320 KB/thread
+- **`--window N`** picks an explicit size, snapped to a supported one:
+  64/128/256/512/1024/2048/4096/8192/16384 plus the ×1.5 "half" sizes
+  1536/3072/6144/12288 (all multiples of 512) that fill the gaps so a window can
+  be chosen closer to what VRAM allows. 16384 is the ceiling, at ~320 KB/thread
   (under the 512 KB local limit); its ~7.7 GB reserve on a 16-SM GPU fits only on
-  8 GB+ cards, so on most GPUs the practical top is 2048–4096.
+  8 GB+ cards, so on 4 GB cards the practical top is 4096–6144.
 - **default (auto)** selects the largest window whose reserve fits free VRAM;
   on out-of-memory it auto-falls back to a smaller one.
 
@@ -180,8 +218,11 @@ The sweet spot is **hardware-dependent**: the per-window inversions are already
 small by ~1024, so on some GPUs larger windows are flat or slightly slower,
 while on others they give a real gain — and whether they fit at all depends on
 VRAM. Use **`--benchmark`**: it measures `Mkeys/s` and the memory reserve for
-every window (unfitting ones show `OOM/skip`), then sweeps the block size at the
-fastest window and prints the `--window`/`--tpb` to use.
+every window (unfitting ones show `OOM/skip`), then sweeps the block size over
+the top two windows and prints the `--window`/`--tpb` to use. Do sweep `--tpb`
+too: the kernel uses ~160 registers per thread, so the per-block register budget
+caps the block size below 512, and resident-warps-per-SM granularity makes the
+best block size non-obvious.
 
 ## Correctness
 

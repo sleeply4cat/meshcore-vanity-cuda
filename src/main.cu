@@ -6,9 +6,10 @@
 // candidates with Montgomery's batch-inversion trick.
 //
 // Each thread g owns candidates s = base + (g*WINDOW + j)*8, j in [0,WINDOW).
-// One fixed-base multiply computes its window start P0 = (base + g*WINDOW*8)*B,
-// then it walks P += 8B, storing (y,z) for every point, batch-inverts the z's,
-// and prefix-checks each affine y.
+// One fixed-base multiply computes the *centre* of that span, then the window is
+// walked outwards in +/-i pairs: since -Q = (-x, y), one table entry i*D yields
+// both s = centre +/- 8i, so a window of W candidates needs only W/2 table
+// entries and W/2 batch-inversion slots.
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,14 +24,19 @@
 
 // Window = candidates per thread per launch (batch size). It is chosen at
 // runtime (--window, or auto-fit to VRAM); the kernel is templated on it so the
-// per-thread buffers stay compile-time sized. MAXW bounds the precomputed table.
-#define MAXW 8192
-// Supported windows, descending. The single per-thread buffer (pref) is W*40
-// bytes of local memory, so W=8192 = 320 KB/thread, still under the 512 KB
-// per-thread local limit (num and den are recomputed, not stored). Bigger
-// windows amortize the two per-window inversions over more candidates but
-// reserve much more VRAM (8192 needs an 8 GB+ GPU); pick them with --window.
-static const int kWindows[] = {8192, 4096, 2048, 1024, 512, 256, 128, 64};
+// per-thread buffers stay compile-time sized.
+//
+// Supported windows, descending. The single per-thread buffer (pref) holds one
+// prefix product per +/-i PAIR, i.e. W/2 elements = W*20 bytes of local memory,
+// so W=16384 = 320 KB/thread, still under the 512 KB per-thread local limit
+// (numerators and denominators are recomputed, not stored). Bigger windows
+// amortize the two per-window inversions over more candidates but reserve much
+// more VRAM (16384 needs a 16 GB+ GPU); pick them with --window. The 1.5x
+// "half" windows (1536/3072/6144/12288) fill the gaps between powers of two so
+// a size can be chosen closer to what VRAM allows; all are multiples of 512
+// (a warp is 32, a default block 256) for clean local-frame/table alignment.
+static const int kWindows[] = {16384, 12288, 8192, 6144, 4096, 3072, 2048,
+                               1536, 1024, 512, 256, 128, 64};
 
 #define RESULT_CAP 4096      // max matches recorded per launch
 
@@ -86,8 +92,10 @@ __device__ static void ge_to_affine(bignum25519 ax, bignum25519 ay, const ge2551
 }
 
 // -------------------------------------------------------------------------
-// Precompute the step table: affine coords of i*D (D = 8B) for i in [1,WINDOW),
+// Precompute the step table: affine coords of i*D (D = 8B) for i in [1,WINDOW/2],
 // plus P_i = x_i*y_i (so the hot loop needs no extra mul for the denominator).
+// Only half a window is tabulated because entry i serves both s = centre + 8i
+// and s = centre - 8i (negating a point flips only x).
 // These points are identical for every thread, so this runs once and the main
 // kernel just reads the table (broadcast across the warp). Single thread; the
 // per-point inversion cost is one-time and negligible.
@@ -96,29 +104,41 @@ __global__ void build_step_table_kernel(bignum25519 *gx, bignum25519 *gy, bignum
     ge25519_niels D; load_step_8B(&D);
     uint8_t eight[32]; for (int k = 0; k < 32; k++) eight[k] = 0; eight[0] = 8;
     ge25519 Q; scalar_to_point(&Q, eight);   // Q = 8B = 1*D
-    for (int i = 1; i < window; i++) {
+    const int n = window / 2;
+    for (int i = 1; i <= n; i++) {
         ge_to_affine(gx[i], gy[i], &Q);
         curve25519_mul(gp[i], gx[i], gy[i]);
-        if (i + 1 < window) ge25519_nielsadd2(&Q, &D);   // Q += D
+        if (i < n) ge25519_nielsadd2(&Q, &D);            // Q += D
     }
 }
 
 // -------------------------------------------------------------------------
-// Main search kernel — affine batched-addition walk (only the y-coordinate).
+// Main search kernel — affine batched-addition walk in +/-i pairs (y only).
 //
 // For candidate i (scalar s0 + i*8) the point is P0 + i*D. Using the complete
 // twisted-Edwards (a=-1) addition and keeping only y:
 //     y_i = (x0*x_i + y0*y_i) / (1 - d*x0*y0 * x_i*y_i)
-// where (x0,y0) is the window-start point (one fixed-base multiply per thread)
+// where (x0,y0) is the window-CENTRE point (one fixed-base multiply per thread)
 // and (x_i, y_i, P_i=x_i*y_i) come from the shared precomputed step table.
-// With K = d*x0*y0 (once per thread), each candidate costs ~7 field muls
-// (2 for the numerator, 1 for the denominator, 3 amortized for the shared
-// Montgomery inversion, 1 for y=num*inv) versus ~11 for the projective walk —
-// and the x-coordinate is never computed.
+//
+// Negating a point flips only x (-Q = (-x, y)), so ONE table entry gives two
+// candidates. With A = x0*x_i, B = y0*y_i and C = K*P_i (K = d*x0*y0, computed
+// once per thread) the pair costs three muls up front:
+//     centre + 8i:  y = (B + A) / (1 - C)
+//     centre - 8i:  y = (B - A) / (1 + C)
+// and, crucially, the two denominators share one batch-inversion slot because
+//     (1 - C)*(1 + C) = 1 - C^2      (one squaring)
+// which is then split back with two muls: 1/(1-C) = (1+C)*inv, and vice versa.
+// That is ~10 muls + 2 squarings per PAIR (~5.5 per candidate, vs ~8 for the
+// one-sided walk) and halves both the local-memory buffer and the step table.
 //
 // Register/occupancy tuning (maxrregcount, __launch_bounds__) was benchmarked
 // and is neutral-to-worse: ALU-bound, high ILP saturates the int units even at
-// low occupancy, so plain launch is best.
+// low occupancy, so plain launch is best. (Re-measured for the pair walk, whose
+// wider live set pushes the kernel to ~160 registers: forcing it back to 128 to
+// unlock tpb=512 costs more than the extra resident warps return.) The 160-reg
+// footprint does cap the block size below 512 on a 64K-register-per-block GPU —
+// --benchmark sweeps tpb, so it lands on a launchable peak by itself.
 template <int W>
 __global__ void vanity_kernel(const uint8_t *__restrict__ base,
                               const bignum25519 *__restrict__ gx,
@@ -129,17 +149,21 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
                               int prefix_len,
                               unsigned long long *__restrict__ out_count,
                               unsigned long long *__restrict__ out_units) {
+    const int H = W / 2;
     const unsigned long long gid =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned long long start_unit = gid * (unsigned long long)W;
+    // The thread still owns units [gid*W, gid*W + W); it just works outwards
+    // from the middle of that span, so the covered range (and hence the clamp
+    // and no-overlap analysis) is exactly as before.
+    const unsigned long long centre_unit = gid * (unsigned long long)W + (unsigned long long)H;
 
     // Cache the small prefix (<=32 bytes).
     uint8_t lreq[32], lmask[32];
     for (int i = 0; i < prefix_len; i++) { lreq[i] = req[i]; lmask[i] = mask[i]; }
 
-    // Window start scalar = base + start_unit*8, then its affine point.
+    // Window centre scalar = base + centre_unit*8, then its affine point.
     uint8_t s0[32];
-    scalar_add_u64(s0, base, start_unit * 8ULL);
+    scalar_add_u64(s0, base, centre_unit * 8ULL);
     clamp_scalar(s0);
 
     ge25519 P;
@@ -165,40 +189,55 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
         if (slot < RESULT_CAP) out_units[slot] = unit;
     };
 
-    // Candidate i=0 is P0 itself: y = y0.
-    check_and_record(y0, start_unit);
+    // The centre candidate needs no table entry and no inversion: y = y0.
+    check_and_record(y0, centre_unit);
 
-    // Candidates i=1..W-1: build each denominator, one shared Montgomery
-    // inversion of all of them, then divide. ONLY the prefix products are
-    // stored. Both the numerator (num_i = x0*x_i + y0*y_i) and the denominator
-    // (den_i = 1 - K*gp_i) are recomputed in the backward pass from x0,y0,K and
-    // the shared table, so a single W-element buffer holds the whole window
-    // (a third of the original three-buffer footprint). num costs no extra
-    // multiplies (its two just move passes); den costs +1 multiply/candidate
-    // (it is needed in both passes) — a cheap trade for removing another
-    // local-memory store+load stream and for fitting much larger windows.
-    bignum25519 pref[W];
+    // Pairs i=1..H (H = W/2): one batch-inversion slot per pair, holding the
+    // PRODUCT of the two denominators. ONLY the prefix products are stored;
+    // C = K*gp_i, the two denominators and the two numerators are all
+    // recomputed in the backward pass from x0,y0,K and the shared table, so a
+    // single H-element buffer holds the whole window. Recomputing costs one
+    // extra mul + one extra squaring per pair, a cheap trade for removing the
+    // local-memory (DRAM) store+load streams and for fitting larger windows.
+    bignum25519 pref[W / 2];
     bignum25519 acc; curve25519_copy(acc, one);
-    for (int i = 1; i < W; i++) {
-        bignum25519 c, den;
-        curve25519_mul(c, K, gp[i]);    // c = d x0 y0 x_i y_i
-        curve25519_sub_reduce(den, one, c);            // den = 1 - c
-        curve25519_copy(pref[i], acc);                 // prefix product
-        curve25519_mul(acc, acc, den);
+    for (int i = 1; i <= H; i++) {
+        bignum25519 c, cc, prod;
+        curve25519_mul(c, K, gp[i]);                   // C = d x0 y0 x_i y_i
+        curve25519_square(cc, c);
+        curve25519_sub_reduce(prod, one, cc);          // (1-C)(1+C) = 1 - C^2
+        curve25519_copy(pref[i - 1], acc);             // prefix product
+        curve25519_mul(acc, acc, prod);
     }
-    curve25519_recip(acc, acc);                        // 1 / prod(den)
+    curve25519_recip(acc, acc);                        // 1 / prod(1 - C^2)
 
-    for (int i = W - 1; i >= 1; i--) {
-        bignum25519 a, b, c, den, num, inv, y;
-        curve25519_mul(inv, acc, pref[i]);             // 1 / den_i
-        curve25519_mul(c, K, gp[i]);                   // recompute den_i:
-        curve25519_sub_reduce(den, one, c);            //   1 - K gp_i
-        curve25519_mul(acc, acc, den);                 // strip den_i
-        curve25519_mul(a, x0, gx[i]);                  // recompute num_i:
-        curve25519_mul(b, y0, gy[i]);                  //   x0 x_i + y0 y_i
-        curve25519_add_reduce(num, a, b);
-        curve25519_mul(y, num, inv);                   // y_i = num_i / den_i
-        check_and_record(y, start_unit + (unsigned long long)i);
+    for (int i = H; i >= 1; i--) {
+        bignum25519 c, cc, prod, invprod, a, b, num, den, y;
+        curve25519_mul(invprod, acc, pref[i - 1]);     // 1 / ((1-C)(1+C))
+        curve25519_mul(c, K, gp[i]);                   // recompute C
+        curve25519_square(cc, c);
+        curve25519_sub_reduce(prod, one, cc);
+        curve25519_mul(acc, acc, prod);                // strip this pair
+        curve25519_mul(a, x0, gx[i]);                  // A = x0 x_i
+        curve25519_mul(b, y0, gy[i]);                  // B = y0 y_i
+
+        // centre - 8i : y = (B - A) / (1 + C),  1/(1+C) = (1-C) * invprod
+        curve25519_sub_reduce(den, one, c);
+        curve25519_mul(den, den, invprod);
+        curve25519_sub_reduce(num, b, a);
+        curve25519_mul(y, num, den);
+        check_and_record(y, centre_unit - (unsigned long long)i);
+
+        // centre + 8i : y = (B + A) / (1 - C),  1/(1-C) = (1+C) * invprod.
+        // i == H would land on the next thread's first unit, so skip it — the
+        // span stays exactly W units wide and threads never overlap.
+        if (i < H) {
+            curve25519_add_reduce(den, one, c);
+            curve25519_mul(den, den, invprod);
+            curve25519_add_reduce(num, b, a);
+            curve25519_mul(y, num, den);
+            check_and_record(y, centre_unit + (unsigned long long)i);
+        }
     }
 }
 
@@ -329,9 +368,14 @@ static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchAr
 #define LV(W) vanity_kernel<W><<<blocks, tpb>>>(a.base, a.gx, a.gy, a.gp, a.req, a.mask, \
                                                 a.prefix_len, a.count, a.units)
     switch (window) {
+        case 16384: LV(16384); break;
+        case 12288: LV(12288); break;
         case 8192: LV(8192); break;
+        case 6144: LV(6144); break;
         case 4096: LV(4096); break;
+        case 3072: LV(3072); break;
         case 2048: LV(2048); break;
+        case 1536: LV(1536); break;
         case 1024: LV(1024); break;
         case 512:  LV(512);  break;
         case 256:  LV(256);  break;
@@ -347,9 +391,14 @@ static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchAr
 // the runtime introspection helpers (attributes, occupancy) take a single path.
 static const void *vanity_kernel_ptr(int window) {
     switch (window) {
+        case 16384: return (const void *)vanity_kernel<16384>;
+        case 12288: return (const void *)vanity_kernel<12288>;
         case 8192: return (const void *)vanity_kernel<8192>;
+        case 6144: return (const void *)vanity_kernel<6144>;
         case 4096: return (const void *)vanity_kernel<4096>;
+        case 3072: return (const void *)vanity_kernel<3072>;
         case 2048: return (const void *)vanity_kernel<2048>;
+        case 1536: return (const void *)vanity_kernel<1536>;
         case 1024: return (const void *)vanity_kernel<1024>;
         case 512:  return (const void *)vanity_kernel<512>;
         case 256:  return (const void *)vanity_kernel<256>;
@@ -362,7 +411,7 @@ static const void *vanity_kernel_ptr(int window) {
 static size_t window_local_bytes(int window) {
     cudaFuncAttributes fa;
     if (cudaFuncGetAttributes(&fa, vanity_kernel_ptr(window)) != cudaSuccess)
-        return (size_t)window * 40;
+        return (size_t)window * 20;   // W/2 prefix products x 40 bytes
     return fa.localSizeBytes;
 }
 
@@ -433,7 +482,7 @@ int main(int argc, char **argv) {
         else if (a == "-h" || a == "--help") {
             printf("Usage: %s <HEX_PREFIX> [options]\n"
                    "  -l, --limit N     stop after N matches (0 = infinite) [1]\n"
-                   "  -w, --window N    batch/thread: 64|128|256|512|1024|2048|4096|8192 [auto-fit VRAM]\n"
+                   "  -w, --window N    batch/thr: 64..16384 incl. 1536/3072/6144/12288 [auto VRAM]\n"
                    "                    bigger = faster but more GPU memory\n"
                    "      --blocks N    CUDA blocks [512]\n"
                    "      --tpb N       threads per block [256]\n"
@@ -470,9 +519,14 @@ int main(int argc, char **argv) {
                         "to find the fastest for your GPU)\n", window);
     } else {
         int snap = nearest_window(window);
-        if (snap != window)
-            fprintf(stderr, "Window: %d not supported, using %d (supported: 64/128/256/512/1024/2048/4096/8192)\n",
-                    window, snap);
+        if (snap != window) {
+            // Print the supported list from kWindows itself so it never drifts.
+            std::string sup;
+            for (int i = (int)(sizeof(kWindows) / sizeof(kWindows[0])) - 1; i >= 0; i--)
+                sup += (sup.empty() ? "" : "/") + std::to_string(kWindows[i]);
+            fprintf(stderr, "Window: %d not supported, using %d (supported: %s)\n",
+                    window, snap, sup.c_str());
+        }
         window = snap;
     }
 
@@ -504,11 +558,12 @@ int main(int argc, char **argv) {
     cuda_check(cudaMalloc(&d_scalar, 32), "malloc scalar");
     cuda_check(cudaMalloc(&d_pub, 32), "malloc pub");
 
-    // Shared precomputed step table i*D (affine x, y and x*y), i in [1,window).
+    // Shared precomputed step table i*D (affine x, y and x*y), i in [1,window/2].
+    const size_t tbl = (size_t)(window / 2) + 1;
     bignum25519 *d_gx, *d_gy, *d_gp;
-    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * window), "malloc gx");
-    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * window), "malloc gy");
-    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * window), "malloc gp");
+    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * tbl), "malloc gx");
+    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * tbl), "malloc gy");
+    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * tbl), "malloc gp");
     build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
     cuda_check(cudaGetLastError(), "build_step_table launch");
     cuda_check(cudaDeviceSynchronize(), "build_step_table sync");
@@ -676,9 +731,9 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
         cudaMalloc(&d_mask, PL) == cudaSuccess &&
         cudaMalloc(&d_count, sizeof(unsigned long long)) == cudaSuccess &&
         cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP) == cudaSuccess &&
-        cudaMalloc(&d_gx, sizeof(bignum25519) * w) == cudaSuccess &&
-        cudaMalloc(&d_gy, sizeof(bignum25519) * w) == cudaSuccess &&
-        cudaMalloc(&d_gp, sizeof(bignum25519) * w) == cudaSuccess;
+        cudaMalloc(&d_gx, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
+        cudaMalloc(&d_gy, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
+        cudaMalloc(&d_gp, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess;
     if (ok) {
         cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice);
         cudaMemcpy(d_req, req.data(), PL, cudaMemcpyHostToDevice);
@@ -725,10 +780,11 @@ static int run_benchmark(int blocks, int tpb) {
     cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
 
-    // Phase 1 — window sweep at the base block size.
+    // Phase 1 — window sweep at the base block size; keep the top two fitting
+    // windows for the grid sweep.
     fprintf(stderr, "Benchmarking on %d SM (blocks %d, tpb %d)...\n", numSM, blocks, tpb);
     printf("%6s  %10s  %8s  %9s\n", "window", "Mkeys/s", "loc/thr", "reserve");
-    double best_mps = 0; int best_w = 0, best_tpb = tpb;
+    double best_mps = 0, second_mps = 0; int best_w = 0, second_w = 0;
     const int nW = (int)(sizeof(kWindows) / sizeof(kWindows[0]));
     for (int idx = nW - 1; idx >= 0; idx--) {      // ascending, small windows first
         int w = kWindows[idx];
@@ -739,23 +795,36 @@ static int run_benchmark(int blocks, int tpb) {
             printf("%6d  %10s  %6zuKB  %6zuMB\n", w, "OOM/skip", localB >> 10, reserveMB);
         else {
             printf("%6d  %10.1f  %6zuKB  %6zuMB\n", w, mps, localB >> 10, reserveMB);
-            if (mps > best_mps) { best_mps = mps; best_w = w; }
+            if (mps > best_mps) { second_mps = best_mps; second_w = best_w; best_mps = mps; best_w = w; }
+            else if (mps > second_mps) { second_mps = mps; second_w = w; }
         }
         fflush(stdout);
     }
 
-    // Phase 2 — block-size sweep at the fastest window (blocks held fixed;
-    // beyond a few waves it barely matters, tpb changes occupancy/registers).
+    // Phase 2 — grid sweep over the top two windows x block size. Two windows,
+    // not one, because the per-block register limit can bar a large tpb on the
+    // biggest window while a slightly smaller one still allows it (the window
+    // ranking is not separable from tpb). Blocks are held fixed: beyond a few
+    // waves they barely matter.
+    int gw = best_w, gtpb = tpb; double gmps = best_mps;
     if (best_w) {
-        printf("\nBlock-size sweep at --window %d:\n%6s  %10s\n", best_w, "tpb", "Mkeys/s");
-        for (int t : {128, 256, 512, 1024}) {
-            double mps = bench_one(best_w, blocks, t, dev);
-            if (mps < 0) printf("%6d  %10s\n", t, "skip");
-            else {
-                printf("%6d  %10.1f\n", t, mps);
-                if (mps > best_mps) { best_mps = mps; best_tpb = t; }
+        const int cand[2] = {best_w, second_w};
+        const int ncand = second_w ? 2 : 1;
+        printf("\nGrid sweep (top windows x block size):\n%8s  %6s  %10s\n",
+               "window", "tpb", "Mkeys/s");
+        for (int c = 0; c < ncand; c++) {
+            // 384 is in the list because the kernel's register footprint puts
+            // the per-block register cap between 256 and 512 on current GPUs,
+            // and the resident-threads-per-SM granularity makes it a real peak.
+            for (int t : {128, 256, 384, 512, 1024}) {
+                double mps = bench_one(cand[c], blocks, t, dev);
+                if (mps < 0) printf("%8d  %6d  %10s\n", cand[c], t, "skip");
+                else {
+                    printf("%8d  %6d  %10.1f\n", cand[c], t, mps);
+                    if (mps > gmps) { gmps = mps; gw = cand[c]; gtpb = t; }
+                }
+                fflush(stdout);
             }
-            fflush(stdout);
         }
     }
 
@@ -764,6 +833,6 @@ static int run_benchmark(int blocks, int tpb) {
     printf("(reserve = worst-case local memory the driver pins = "
            "SM count x maxThreadsPerSM x loc/thr)\n");
     if (best_w)
-        printf("Fastest: --window %d --tpb %d  (%.1f Mkeys/s)\n", best_w, best_tpb, best_mps);
+        printf("Fastest: --window %d --tpb %d  (%.1f Mkeys/s)\n", gw, gtpb, gmps);
     return 0;
 }

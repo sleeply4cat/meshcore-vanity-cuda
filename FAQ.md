@@ -3,7 +3,7 @@
 ### What does this do?
 It brute-forces MeshCore Ed25519 keypairs on the GPU until the public key starts
 with a hex prefix you choose (a "vanity" key). It's a from-scratch CUDA rewrite
-of the OpenCL `nano-vanity`/MeshCore fork, ~49× faster on the same GPU.
+of the OpenCL `nano-vanity`/MeshCore fork, ~90× faster on the same GPU.
 
 ### Are the keys real MeshCore keys?
 Yes. The output is exactly the MeshCore format: a 64-hex public key and a
@@ -28,8 +28,8 @@ ramp — roughly halves the first few seconds).
 
 ### How long will my prefix take?
 Each hex nibble is 4 bits, so an N-nibble prefix needs ~2^(4N) attempts on
-average. As a rough guide at ~300 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
-~15 s, 10 nibbles ≈ ~1 h, 12 nibbles ≈ ~10 days. The tool prints
+average. As a rough guide at ~600 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
+~7 s, 10 nibbles ≈ ~30 min, 12 nibbles ≈ ~5 days. The tool prints
 `Estimated attempts: 2^bits` at startup.
 
 ### Can I match multiple prefixes, a suffix, or a regex?
@@ -65,7 +65,7 @@ driver libs instead, e.g.
 
 ### `out of memory` at kernel launch?
 Large windows reserve a lot of GPU memory — the driver pins per-thread local
-memory for the SM's full thread capacity (`SM_count × maxThreadsPerSM × W·40`
+memory for the SM's full thread capacity (`SM_count × maxThreadsPerSM × W·20`
 bytes), which for big `W` can be several GB. The default auto-fits the window to
 free VRAM and falls back to smaller windows on OOM. If it still fails, lower
 `--blocks` or set a smaller `--window` (e.g. `128` or `64`). Run `--benchmark`
@@ -73,9 +73,11 @@ to see which windows actually fit your GPU (unfitting ones show `OOM/skip`).
 
 ### Which `--window` (and `--tpb`) should I use?
 Run `--benchmark`: it times every window that fits (~1s each) with the memory
-reserve, then sweeps the block size at the fastest window and prints the exact
+reserve, then sweeps the block size over the top two windows and prints the exact
 `--window`/`--tpb` to use. Gains above ~1024 are hardware-dependent, so measure
-rather than assume bigger is better.
+rather than assume bigger is better — and don't skip the `--tpb` part: the
+kernel needs ~160 registers per thread, so the 64K-registers-per-block limit
+bars `--tpb 512`, and 128 or 384 usually beat the 256 default.
 
 ### Is it safe? Is my private key exposed?
 The private key is generated locally on your machine and only printed to stdout —
