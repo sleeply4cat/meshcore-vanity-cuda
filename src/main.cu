@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <array>
@@ -115,6 +116,23 @@ __global__ void build_step_table_kernel(bignum25519 *gx, bignum25519 *gy, bignum
 }
 
 // -------------------------------------------------------------------------
+// Affine coords of D = (units*8)*B, the point every thread adds to its window
+// centre between launches, plus PD = xD*yD. `units` is total_threads * window,
+// i.e. exactly the span the host adds to `base`, so the persistent walk and the
+// host counter stay in lockstep. Runs once per configuration; single thread.
+// -------------------------------------------------------------------------
+__global__ void build_launch_step_kernel(bignum25519 *out3, unsigned long long units) {
+    uint8_t s[32];
+    for (int k = 0; k < 32; k++) s[k] = 0;
+    unsigned long long v = units * 8ULL;
+    for (int k = 0; k < 8; k++) s[k] = (uint8_t)(v >> (8 * k));
+    ge25519 P;
+    scalar_to_point(&P, s);
+    ge_to_affine(out3[0], out3[1], &P);
+    curve25519_mul(out3[2], out3[0], out3[1]);
+}
+
+// -------------------------------------------------------------------------
 // Low 8 bytes of the compressed encoding of a field element, as one uint64.
 //
 // The filter only ever looks at the first bytes of the key and the encoding is
@@ -188,15 +206,18 @@ __device__ static uint64_t curve25519_contract_lo64(const bignum25519 in) {
 // That is ~10 muls + 2 squarings per PAIR (~5.5 per candidate, vs ~8 for the
 // one-sided walk) and halves both the local-memory buffer and the step table.
 //
-// Register/occupancy tuning (maxrregcount, __launch_bounds__) was benchmarked
-// and is neutral-to-worse: ALU-bound, high ILP saturates the int units even at
-// low occupancy, so plain launch is best. (Re-measured for the pair walk, whose
-// wider live set pushes the kernel to ~160 registers: forcing it back to 128 to
-// unlock tpb=512 costs more than the extra resident warps return.) The 160-reg
-// footprint does cap the block size below 512 on a 64K-register-per-block GPU —
-// --benchmark sweeps tpb, so it lands on a launchable peak by itself.
+// Occupancy tuning: forcing the register count far down (maxrregcount=128, to
+// unlock tpb=512) was benchmarked and loses — the kernel is ALU-bound, high ILP
+// saturates the integer units even at low occupancy, so the extra resident
+// warps do not pay for the spills. The cap does matter at the margin, though: a
+// block may use 65536 registers, allocated per warp in units of 256, so a
+// 12-warp block (tpb=384) needs <= 168 registers per thread. Left alone the
+// kernel lands just above that and tpb=384 stops launching. __launch_bounds__
+// pins it to the useful side of that cliff, and does it in the source, so every
+// build path (Makefile, `make release`, the Windows CI nvcc line) inherits it.
+#define VANITY_MAX_TPB 384
 template <int W>
-__global__ void vanity_kernel(const uint8_t *__restrict__ base,
+__global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(const uint8_t *__restrict__ base,
                               const bignum25519 *__restrict__ gx,
                               const bignum25519 *__restrict__ gy,
                               const bignum25519 *__restrict__ gp,
@@ -204,7 +225,11 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
                               const uint8_t *__restrict__ mask,
                               int prefix_len,
                               unsigned long long *__restrict__ out_count,
-                              unsigned long long *__restrict__ out_units) {
+                              unsigned long long *__restrict__ out_units,
+                              const bignum25519 *__restrict__ dstep,
+                              bignum25519 *__restrict__ sx,
+                              bignum25519 *__restrict__ sy,
+                              int have_state) {
     const int H = W / 2;
     const unsigned long long gid =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -224,15 +249,23 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
         mask8 |= (uint64_t)mask[i] << (8 * i);
     }
 
-    // Window centre scalar = base + centre_unit*8, then its affine point.
-    uint8_t s0[32];
-    scalar_add_u64(s0, base, centre_unit * 8ULL);
-    clamp_scalar(s0);
-
-    ge25519 P;
-    scalar_to_point(&P, s0);
+    // The window-centre affine point. On the first launch of a configuration it
+    // costs a fixed-base comb plus an inversion (~600 field multiplies); after
+    // that the thread just picks up where it left off, because the host advances
+    // `base` by exactly the span covered and this kernel advances the point by
+    // the matching multiple of B (see the tail of this function).
     bignum25519 x0, y0;
-    ge_to_affine(x0, y0, &P);
+    if (have_state) {
+        curve25519_copy(x0, sx[gid]);
+        curve25519_copy(y0, sy[gid]);
+    } else {
+        uint8_t s0[32];
+        scalar_add_u64(s0, base, centre_unit * 8ULL);
+        clamp_scalar(s0);
+        ge25519 P;
+        scalar_to_point(&P, s0);
+        ge_to_affine(x0, y0, &P);
+    }
 
     // K = d * x0 * y0  (per-thread constant for the denominator).
     bignum25519 K;
@@ -265,8 +298,21 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
     // single H-element buffer holds the whole window. Recomputing costs one
     // extra mul + one extra squaring per pair, a cheap trade for removing the
     // local-memory (DRAM) store+load streams and for fitting larger windows.
+    //
+    // The chain is *seeded* with the denominator that advances this thread to
+    // its next window centre, rather than with 1. That slot therefore needs no
+    // stored prefix product (its prefix is the empty product, 1), and after the
+    // backward pass has stripped every pair, `acc` is left holding exactly its
+    // inverse — so the step costs one multiply and one squaring per window and
+    // not a single extra live register. See the tail of the function.
     bignum25519 pref[W / 2];
-    bignum25519 acc; curve25519_copy(acc, one);
+    bignum25519 acc;
+    {
+        bignum25519 cs, css;
+        curve25519_mul(cs, K, dstep[2]);               // Cs = d x0 y0 xD yD
+        curve25519_square(css, cs);
+        curve25519_sub_reduce(acc, one, css);          // (1-Cs)(1+Cs)
+    }
     for (int i = 1; i <= H; i++) {
         bignum25519 c, cc, prod;
         curve25519_mul(c, K, gp[i]);                   // C = d x0 y0 x_i y_i
@@ -275,7 +321,7 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
         curve25519_copy(pref[i - 1], acc);             // prefix product
         curve25519_mul(acc, acc, prod);
     }
-    curve25519_recip(acc, acc);                        // 1 / prod(1 - C^2)
+    curve25519_recip(acc, acc);                        // 1 / (step * prod(1 - C^2))
 
     for (int i = H; i >= 1; i--) {
         bignum25519 c, cc, prod, invprod, a, b, num, den, y;
@@ -304,6 +350,32 @@ __global__ void vanity_kernel(const uint8_t *__restrict__ base,
             curve25519_mul(y, num, den);
             check_and_record(y, centre_unit + (unsigned long long)i);
         }
+    }
+
+    // Advance the thread's centre by D = (total_threads * W * 8) * B, which is
+    // exactly the span the host adds to `base`, and hand it to the next launch.
+    // Every pair denominator has now been stripped from `acc`, so what is left
+    // is 1/((1-Cs)(1+Cs)) — the seed slot — and the two affine addition
+    // denominators come out of it with one multiply each:
+    //     x' = (x0 yD + y0 xD) / (1 + Cs),   1/(1+Cs) = (1 - Cs) * acc
+    //     y' = (y0 yD + x0 xD) / (1 - Cs),   1/(1-Cs) = (1 + Cs) * acc
+    {
+        bignum25519 cs, t, u, a, b, num;
+        curve25519_mul(cs, K, dstep[2]);               // recompute Cs
+        curve25519_sub_reduce(t, one, cs);
+        curve25519_add_reduce(u, one, cs);
+        curve25519_mul(t, t, acc);                     // 1 / (1 + Cs)
+        curve25519_mul(u, u, acc);                     // 1 / (1 - Cs)
+        curve25519_mul(a, x0, dstep[1]);               // x0 * yD
+        curve25519_mul(b, y0, dstep[0]);               // y0 * xD
+        curve25519_add_reduce(num, a, b);
+        curve25519_mul(num, num, t);
+        curve25519_copy(sx[gid], num);
+        curve25519_mul(a, y0, dstep[1]);               // y0 * yD
+        curve25519_mul(b, x0, dstep[0]);               // x0 * xD
+        curve25519_add_reduce(num, a, b);
+        curve25519_mul(num, num, u);
+        curve25519_copy(sy[gid], num);
     }
 }
 
@@ -437,13 +509,17 @@ struct LaunchArgs {
     const uint8_t *base; const bignum25519 *gx, *gy, *gp;
     const uint8_t *req, *mask; int prefix_len;
     unsigned long long *count, *units;
+    const bignum25519 *dstep;            // affine (xD, yD, xD*yD) of the launch step
+    bignum25519 *sx, *sy;                // persistent per-thread centre point
+    int have_state;                      // 0 = seed from `base` (first launch)
 };
 
 // Launch the vanity kernel instantiation for a runtime window. Returns the
 // launch error (e.g. cudaErrorMemoryAllocation if the local frame won't fit).
 static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchArgs &a) {
 #define LV(W) vanity_kernel<W><<<blocks, tpb>>>(a.base, a.gx, a.gy, a.gp, a.req, a.mask, \
-                                                a.prefix_len, a.count, a.units)
+                                                a.prefix_len, a.count, a.units,          \
+                                                a.dstep, a.sx, a.sy, a.have_state)
     switch (window) {
         case 16384: LV(16384); break;
         case 12288: LV(12288); break;
@@ -505,7 +581,18 @@ static size_t window_reserve_bytes(int window, int numSM, int maxThreadsSM) {
 }
 
 // Largest supported window whose local-memory reserve fits free VRAM with a
-// margin.
+// margin, but not larger than AUTO_WINDOW_CAP.
+//
+// The cap exists because the persistent walk removed the reason to go big. The
+// per-window fixed-base multiply and its inversion used to cost ~600 field
+// multiplies per thread per launch, which only a large W could amortise; now a
+// thread carries its centre across launches and pays ~12. What is left that
+// still scales with W is the single Montgomery inversion, ~152 multiplies per
+// window against ~5.5 per candidate — so going past 2048 can buy at most
+// 152/2048/5.5 ≈ 1.3%, while the memory reserve grows in proportion to W. That
+// bound is arithmetic, not hardware-specific. --window and --benchmark are
+// still there for anyone who wants to chase the last percent.
+#define AUTO_WINDOW_CAP 2048
 static int auto_window() {
     size_t freeB = 0, totalB = 0;
     cudaMemGetInfo(&freeB, &totalB);
@@ -514,7 +601,8 @@ static int auto_window() {
     cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
     for (int w : kWindows)
-        if ((double)window_reserve_bytes(w, numSM, maxThreadsSM) < 0.85 * (double)freeB)
+        if (w <= AUTO_WINDOW_CAP &&
+            (double)window_reserve_bytes(w, numSM, maxThreadsSM) < 0.85 * (double)freeB)
             return w;
     return kWindows[sizeof(kWindows) / sizeof(kWindows[0]) - 1];  // smallest
 }
@@ -562,7 +650,7 @@ int main(int argc, char **argv) {
                    "  -w, --window N    batch/thr: 64..16384 incl. 1536/3072/6144/12288 [auto VRAM]\n"
                    "                    bigger = faster but more GPU memory\n"
                    "      --blocks N    CUDA blocks [512]\n"
-                   "      --tpb N       threads per block [256]\n"
+                   "      --tpb N       threads per block, 32..384 [256]\n"
                    "  -d, --device I    CUDA device index [0]\n"
                    "      --no-progress suppress progress output\n"
                    "      --selftest    run correctness self-tests and exit\n"
@@ -573,6 +661,16 @@ int main(int argc, char **argv) {
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "Unknown option %s\n", a.c_str()); return 1; }
         else prefix = a;
     }
+
+    // The kernel is compiled with __launch_bounds__(VANITY_MAX_TPB); a larger
+    // block cannot launch at all, so say so here instead of letting it fail
+    // later with a bare "too many resources requested for launch".
+    if (tpb > VANITY_MAX_TPB) {
+        fprintf(stderr, "Block size %d exceeds the kernel's limit, using %d.\n",
+                tpb, VANITY_MAX_TPB);
+        tpb = VANITY_MAX_TPB;
+    }
+    if (tpb < 32) { fprintf(stderr, "Block size must be at least 32.\n"); return 1; }
 
     cuda_check(cudaSetDevice(device), "setDevice");
     // Block (sleep) the host thread while waiting on the GPU instead of the
@@ -647,6 +745,21 @@ int main(int argc, char **argv) {
     cuda_check(cudaMemcpy(d_req, req.data(), prefix_len, cudaMemcpyHostToDevice), "memcpy req");
     cuda_check(cudaMemcpy(d_mask, mask.data(), prefix_len, cudaMemcpyHostToDevice), "memcpy mask");
 
+    // Persistent per-thread window centre + the launch step point. Both depend
+    // on (blocks, tpb, window), so a window fallback invalidates them.
+    bignum25519 *d_sx, *d_sy, *d_dstep;
+    cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * threads), "malloc state x");
+    cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * threads), "malloc state y");
+    cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "malloc dstep");
+    int have_state = 0;
+    auto rebuild_step = [&]() {
+        build_launch_step_kernel<<<1, 1>>>(d_dstep, per_launch);
+        cuda_check(cudaGetLastError(), "build_launch_step launch");
+        cuda_check(cudaDeviceSynchronize(), "build_launch_step sync");
+        have_state = 0;
+    };
+    rebuild_step();
+
     // Random, once-only base counter (advanced deterministically per launch).
     uint8_t base[32];
     fill_random(base, 32);
@@ -661,7 +774,8 @@ int main(int argc, char **argv) {
         cuda_check(cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice), "memcpy base");
         cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "memset count");
 
-        LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, prefix_len, d_count, d_units};
+        LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, prefix_len, d_count, d_units,
+                      d_dstep, d_sx, d_sy, have_state};
         cudaError_t le = launch_vanity(window, blocks, tpb, la);
         if (le == cudaErrorMemoryAllocation) {
             // Auto-fall back to a smaller window (shrinks the per-thread local
@@ -673,6 +787,11 @@ int main(int argc, char **argv) {
                 window = smaller;
                 per_launch = threads * (unsigned long long)window;
                 cudaGetLastError();  // clear
+                // The span per launch changed, so both the persistent centres
+                // and the step point are stale: rebuild and re-seed.
+                build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
+                cuda_check(cudaDeviceSynchronize(), "rebuild step table");
+                rebuild_step();
                 continue;
             }
             fprintf(stderr, "\nCUDA out of memory even at the smallest window (%d). "
@@ -681,6 +800,7 @@ int main(int argc, char **argv) {
         }
         cuda_check(le, "kernel launch");
         cuda_check(cudaDeviceSynchronize(), "sync");
+        have_state = 1;      // the kernel just wrote each thread's next centre
 
         unsigned long long count = 0;
         cuda_check(cudaMemcpy(&count, d_count, sizeof(count), cudaMemcpyDeviceToHost), "copy count");
@@ -726,7 +846,22 @@ int main(int argc, char **argv) {
             if (std::chrono::duration<double>(now - tlast).count() >= 0.3) {
                 double secs = std::chrono::duration<double>(now - t0).count();
                 double mps = secs > 0 ? attempts / secs / 1e6 : 0;
-                fprintf(stderr, "\rTried %llu keys (%.1f Mkeys/s)", attempts, mps);
+                char line[128];
+                int n = snprintf(line, sizeof line, "Tried %llu keys (%.1f Mkeys/s)",
+                                 attempts, mps);
+                if (found == 0 && n > 0 && n < (int)sizeof line) {
+                    // Chance the span already searched contained a match. Each
+                    // candidate is a distinct scalar matching with p = 2^-bits,
+                    // so P = 1 - (1-p)^attempts. expm1/log1p keep that accurate
+                    // when p is tiny and the product would underflow a plain pow.
+                    double p = ldexp(1.0, -bits);
+                    double hit = -expm1((double)attempts * log1p(-p));
+                    snprintf(line + n, sizeof line - n,
+                             ", %.3g%% chance it was already in range", hit * 100.0);
+                }
+                // Left-pad to a fixed width: the line shrinks once a key is
+                // found, and a bare \r would leave the old tail on screen.
+                fprintf(stderr, "\r%-76s", line);
                 tlast = now;
             }
         }
@@ -798,15 +933,30 @@ static int check_contract_lo64() {
 // walk, whose failure mode is silently losing or duplicating candidates rather
 // than producing wrong keys.
 // -------------------------------------------------------------------------
+// Each vanity_kernel<W> instantiation pins its own local-memory reserve for the
+// lifetime of the context, so running several in one context piles them up and
+// can exhaust a small or busy GPU. Give every window test a fresh context, the
+// same way bench_one does, and report a genuine shortage as a skip rather than
+// failing a correctness test for an environmental reason.
+static void fresh_context() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceReset();
+    cudaSetDevice(dev);
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+}
+
 static int check_window_coverage(int window, int blocks, int tpb) {
     const unsigned long long expect = (unsigned long long)blocks * tpb * window;
     if (expect > RESULT_CAP) { printf("[selftest] coverage W=%d skipped (too many units)\n", window); return 0; }
+    fresh_context();
 
     uint8_t base[32]; fill_random(base, 32); clamp_scalar(base);
     uint8_t *d_base, *d_req;
     unsigned long long *d_count, *d_units;
-    bignum25519 *d_gx, *d_gy, *d_gp;
+    bignum25519 *d_gx, *d_gy, *d_gp, *d_sx, *d_sy, *d_dstep;
     const size_t tbl = (size_t)(window / 2) + 1;
+    const unsigned long long thr = (unsigned long long)blocks * tpb;
     cuda_check(cudaMalloc(&d_base, 32), "cov malloc base");
     cuda_check(cudaMalloc(&d_req, 1), "cov malloc req");
     cuda_check(cudaMalloc(&d_count, sizeof(unsigned long long)), "cov malloc count");
@@ -814,13 +964,24 @@ static int check_window_coverage(int window, int blocks, int tpb) {
     cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * tbl), "cov malloc gx");
     cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * tbl), "cov malloc gy");
     cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * tbl), "cov malloc gp");
+    cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * thr), "cov malloc sx");
+    cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * thr), "cov malloc sy");
+    cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "cov malloc dstep");
     cuda_check(cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice), "cov memcpy base");
     cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "cov memset");
     build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
+    build_launch_step_kernel<<<1, 1>>>(d_dstep, thr * (unsigned long long)window);
     cuda_check(cudaDeviceSynchronize(), "cov table");
 
-    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_req, 0, d_count, d_units};
-    cuda_check(launch_vanity(window, blocks, tpb, la), "cov launch");
+    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_req, 0, d_count, d_units,
+                  d_dstep, d_sx, d_sy, 0};
+    cudaError_t le = launch_vanity(window, blocks, tpb, la);
+    if (le == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        printf("[selftest] window %5d coverage: skipped (not enough free VRAM)\n", window);
+        return 0;
+    }
+    cuda_check(le, "cov launch");
     cuda_check(cudaDeviceSynchronize(), "cov sync");
 
     unsigned long long count = 0;
@@ -831,12 +992,95 @@ static int check_window_coverage(int window, int blocks, int tpb) {
                               cudaMemcpyDeviceToHost), "cov units");
     cudaFree(d_base); cudaFree(d_req); cudaFree(d_count); cudaFree(d_units);
     cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
+    cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_dstep);
 
     std::sort(units.begin(), units.end());
     bool ok = (count == expect) && (units.size() == expect);
     for (unsigned long long i = 0; ok && i < expect; i++) if (units[i] != i) ok = false;
     printf("[selftest] window %5d coverage (%d x %d threads): %s (%llu/%llu units)\n",
            window, blocks, tpb, ok ? "exact" : "BROKEN", count, expect);
+    return ok ? 0 : 1;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: the persistent walk. Between launches a thread no longer rebuilds
+// its window centre from `base`; it advances the point it kept by D = span*B.
+// If that drifts, the search silently scans the wrong scalars — nothing else
+// would catch it, because the recorded units stay in range either way.
+//
+// So: run the kernel at base2 from a cold seed, and separately run it at base
+// and then at base2 off the carried-over state. With a real (1-byte) prefix the
+// recorded set depends on the actual points, and the two must agree exactly.
+// -------------------------------------------------------------------------
+static int check_persistent_walk(int window, int blocks, int tpb) {
+    fresh_context();
+    const unsigned long long thr = (unsigned long long)blocks * tpb;
+    const unsigned long long span = thr * (unsigned long long)window;
+
+    uint8_t base1[32], base2[32];
+    fill_random(base1, 32); clamp_scalar(base1);
+    scalar_add_u64(base2, base1, span * 8ULL); clamp_scalar(base2);
+
+    const int PL = 1;
+    const uint8_t req = 0x00, msk = 0xFF;      // ~1 hit in 256 candidates
+
+    uint8_t *d_base, *d_req, *d_mask;
+    unsigned long long *d_count, *d_units;
+    bignum25519 *d_gx, *d_gy, *d_gp, *d_sx, *d_sy, *d_dstep;
+    cuda_check(cudaMalloc(&d_base, 32), "pw base");
+    cuda_check(cudaMalloc(&d_req, 1), "pw req");
+    cuda_check(cudaMalloc(&d_mask, 1), "pw mask");
+    cuda_check(cudaMalloc(&d_count, sizeof(unsigned long long)), "pw count");
+    cuda_check(cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP), "pw units");
+    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * (window / 2 + 1)), "pw gx");
+    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * (window / 2 + 1)), "pw gy");
+    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * (window / 2 + 1)), "pw gp");
+    cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * thr), "pw sx");
+    cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * thr), "pw sy");
+    cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "pw dstep");
+    cuda_check(cudaMemcpy(d_req, &req, 1, cudaMemcpyHostToDevice), "pw cp req");
+    cuda_check(cudaMemcpy(d_mask, &msk, 1, cudaMemcpyHostToDevice), "pw cp mask");
+    build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
+    build_launch_step_kernel<<<1, 1>>>(d_dstep, span);
+    cuda_check(cudaDeviceSynchronize(), "pw precompute");
+
+    bool oom = false;
+    auto go = [&](const uint8_t *b, int have_state) {
+        std::vector<unsigned long long> empty;
+        if (oom) return empty;
+        cuda_check(cudaMemcpy(d_base, b, 32, cudaMemcpyHostToDevice), "pw cp base");
+        cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "pw memset");
+        LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, PL, d_count, d_units,
+                      d_dstep, d_sx, d_sy, have_state};
+        cudaError_t le = launch_vanity(window, blocks, tpb, la);
+        if (le == cudaErrorMemoryAllocation) { cudaGetLastError(); oom = true; return empty; }
+        cuda_check(le, "pw launch");
+        cuda_check(cudaDeviceSynchronize(), "pw sync");
+        unsigned long long n = 0;
+        cuda_check(cudaMemcpy(&n, d_count, sizeof(n), cudaMemcpyDeviceToHost), "pw count");
+        if (n > RESULT_CAP) n = RESULT_CAP;
+        std::vector<unsigned long long> v(n);
+        if (n) cuda_check(cudaMemcpy(v.data(), d_units, sizeof(unsigned long long) * n,
+                                     cudaMemcpyDeviceToHost), "pw units");
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+
+    std::vector<unsigned long long> cold = go(base2, 0);   // seeded straight at base2
+    (void)go(base1, 0);                                    // seed at base1, carry state
+    std::vector<unsigned long long> warm = go(base2, 1);   // must land on base2 by walking
+
+    cudaFree(d_base); cudaFree(d_req); cudaFree(d_mask); cudaFree(d_count); cudaFree(d_units);
+    cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
+    cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_dstep);
+
+    if (oom) {
+        printf("[selftest] window %5d persistent walk: skipped (not enough free VRAM)\n", window);
+        return 0;
+    }
+    bool ok = !cold.empty() && cold == warm;
+    printf("[selftest] window %5d persistent walk == cold seed: %s (%zu vs %zu hits)\n",
+           window, ok ? "identical" : "BROKEN", cold.size(), warm.size());
     return ok ? 0 : 1;
 }
 
@@ -885,6 +1129,8 @@ static int run_selftest() {
     fails += check_window_coverage(64, 2, 2);
     fails += check_window_coverage(1024, 1, 2);
     fails += check_window_coverage(1536, 1, 2);
+    fails += check_persistent_walk(256, 8, 64);
+    fails += check_persistent_walk(1536, 4, 32);
 
     return fails == 0 ? 0 : 2;
 }
@@ -912,7 +1158,8 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
 
     uint8_t *d_base, *d_req, *d_mask;
     unsigned long long *d_count, *d_units;
-    bignum25519 *d_gx, *d_gy, *d_gp;
+    bignum25519 *d_gx, *d_gy, *d_gp, *d_sx, *d_sy, *d_dstep;
+    const unsigned long long thr = (unsigned long long)blocks * tpb;
     bool ok =
         cudaMalloc(&d_base, 32) == cudaSuccess &&
         cudaMalloc(&d_req, PL) == cudaSuccess &&
@@ -921,19 +1168,24 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
         cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP) == cudaSuccess &&
         cudaMalloc(&d_gx, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
         cudaMalloc(&d_gy, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
-        cudaMalloc(&d_gp, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess;
+        cudaMalloc(&d_gp, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
+        cudaMalloc(&d_sx, sizeof(bignum25519) * thr) == cudaSuccess &&
+        cudaMalloc(&d_sy, sizeof(bignum25519) * thr) == cudaSuccess &&
+        cudaMalloc(&d_dstep, sizeof(bignum25519) * 3) == cudaSuccess;
     if (ok) {
         cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice);
         cudaMemcpy(d_req, req.data(), PL, cudaMemcpyHostToDevice);
         cudaMemcpy(d_mask, mask.data(), PL, cudaMemcpyHostToDevice);
         cudaMemset(d_count, 0, sizeof(unsigned long long));
         build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, w);
+        build_launch_step_kernel<<<1, 1>>>(d_dstep, thr * (unsigned long long)w);
         if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); ok = false; }
     }
     if (!ok) return -1;
 
-    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, PL, d_count, d_units};
-    unsigned long long per_launch = (unsigned long long)blocks * tpb * (unsigned long long)w;
+    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, PL, d_count, d_units,
+                  d_dstep, d_sx, d_sy, 0};
+    unsigned long long per_launch = thr * (unsigned long long)w;
 
     // Launches until >= target seconds elapse; returns elapsed (or -1 on error)
     // with the candidate count via out-param.
@@ -944,6 +1196,7 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
         do {
             if (launch_vanity(w, blocks, tpb, la) != cudaSuccess) { cudaGetLastError(); return -1; }
             if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return -1; }
+            la.have_state = 1;      // only the first launch pays for the seed
             cand += per_launch;
             el = std::chrono::duration<double>(clock::now() - t0).count();
         } while (el < target);
@@ -1001,10 +1254,11 @@ static int run_benchmark(int blocks, int tpb) {
         printf("\nGrid sweep (top windows x block size):\n%8s  %6s  %10s\n",
                "window", "tpb", "Mkeys/s");
         for (int c = 0; c < ncand; c++) {
-            // 384 is in the list because the kernel's register footprint puts
-            // the per-block register cap between 256 and 512 on current GPUs,
-            // and the resident-threads-per-SM granularity makes it a real peak.
-            for (int t : {128, 256, 384, 512, 1024}) {
+            // VANITY_MAX_TPB is the ceiling (see __launch_bounds__); anything
+            // above it cannot launch, so there is nothing to measure. Within
+            // that range the block size is not monotone — resident threads per
+            // SM move in steps, so 128 and 384 can both beat 256.
+            for (int t : {128, 256, VANITY_MAX_TPB}) {
                 double mps = bench_one(cand[c], blocks, t, dev);
                 if (mps < 0) printf("%8d  %6d  %10s\n", cand[c], t, "skip");
                 else {

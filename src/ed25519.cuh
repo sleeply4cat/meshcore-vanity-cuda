@@ -973,10 +973,36 @@ curve25519_neg( bignum25519 out, const  bignum25519 a) {
 
 /* out = a * b */
 #define curve25519_mul_noinline curve25519_mul
+/* 32x32->64 multiply-accumulate into a (lo,hi) register pair.
+   nvcc compiles `m += (uint64_t)x*y` to three instructions (IMAD.WIDE.U32 +
+   IADD3 + IADD3.X). mad.lo.cc/madc.hi expresses the same thing in a form ptxas
+   folds into a single accumulating IMAD.WIDE.U32, which takes the hot loop from
+   2760 to 2324 SASS instructions and is worth ~6% end to end. The trade is that
+   each pair passes through the one carry flag, so independent accumulators
+   cannot be interleaved as freely -- it was measured, not assumed.
+   Define CURVE25519_NO_PTX_MAC to fall back to plain C. */
+#if defined(__CUDA_ARCH__) && !defined(CURVE25519_NO_PTX_MAC)
+#define MUL64_SET(lo,hi,x,y) asm("mul.lo.u32 %0, %2, %3;\n\t"        \
+                                 "mul.hi.u32 %1, %2, %3;"              \
+                                 : "=r"(lo), "=r"(hi) : "r"(x), "r"(y))
+#define MUL64_ACC(lo,hi,x,y) asm("mad.lo.cc.u32 %0, %2, %3, %0;\n\t" \
+                                 "madc.hi.u32   %1, %2, %3, %1;"       \
+                                 : "+r"(lo), "+r"(hi) : "r"(x), "r"(y))
+#else
+#define MUL64_SET(lo,hi,x,y) do { uint64_t t_ = mul32x32_64(x, y);           \
+                                  lo = (uint32_t)t_; hi = (uint32_t)(t_ >> 32); } while (0)
+#define MUL64_ACC(lo,hi,x,y) do { uint64_t t_ = mul32x32_64(x, y) +          \
+                                      ((((uint64_t)(hi)) << 32) | (lo));     \
+                                  lo = (uint32_t)t_; hi = (uint32_t)(t_ >> 32); } while (0)
+#endif
+#define MUL64_GET(lo,hi) ((((uint64_t)(hi)) << 32) | ((uint64_t)(lo)))
+
 __device__ static void
 curve25519_mul( bignum25519 out, const  bignum25519 a, const  bignum25519 b) {
 	uint32_t r0,r1,r2,r3,r4,r5,r6,r7,r8,r9;
 	uint32_t s0,s1,s2,s3,s4,s5,s6,s7,s8,s9;
+	uint32_t m0l,m0h,m1l,m1h,m2l,m2h,m3l,m3h,m4l,m4h;
+	uint32_t m5l,m5h,m6l,m6h,m7l,m7h,m8l,m8h,m9l,m9h;
 	uint64_t m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,c;
 	uint32_t p;
 
@@ -1002,22 +1028,67 @@ curve25519_mul( bignum25519 out, const  bignum25519 a, const  bignum25519 b) {
 	s8 = a[8];
 	s9 = a[9];
 
-	m1 = mul32x32_64(r0, s1) + mul32x32_64(r1, s0);
-	m3 = mul32x32_64(r0, s3) + mul32x32_64(r1, s2) + mul32x32_64(r2, s1) + mul32x32_64(r3, s0);
-	m5 = mul32x32_64(r0, s5) + mul32x32_64(r1, s4) + mul32x32_64(r2, s3) + mul32x32_64(r3, s2) + mul32x32_64(r4, s1) + mul32x32_64(r5, s0);
-	m7 = mul32x32_64(r0, s7) + mul32x32_64(r1, s6) + mul32x32_64(r2, s5) + mul32x32_64(r3, s4) + mul32x32_64(r4, s3) + mul32x32_64(r5, s2) + mul32x32_64(r6, s1) + mul32x32_64(r7, s0);
-	m9 = mul32x32_64(r0, s9) + mul32x32_64(r1, s8) + mul32x32_64(r2, s7) + mul32x32_64(r3, s6) + mul32x32_64(r4, s5) + mul32x32_64(r5, s4) + mul32x32_64(r6, s3) + mul32x32_64(r7, s2) + mul32x32_64(r8, s1) + mul32x32_64(r9, s0);
+	MUL64_SET(m1l, m1h, r0, s1);
+	MUL64_ACC(m1l, m1h, r1, s0);
+	MUL64_SET(m3l, m3h, r0, s3);
+	MUL64_ACC(m3l, m3h, r1, s2);
+	MUL64_ACC(m3l, m3h, r2, s1);
+	MUL64_ACC(m3l, m3h, r3, s0);
+	MUL64_SET(m5l, m5h, r0, s5);
+	MUL64_ACC(m5l, m5h, r1, s4);
+	MUL64_ACC(m5l, m5h, r2, s3);
+	MUL64_ACC(m5l, m5h, r3, s2);
+	MUL64_ACC(m5l, m5h, r4, s1);
+	MUL64_ACC(m5l, m5h, r5, s0);
+	MUL64_SET(m7l, m7h, r0, s7);
+	MUL64_ACC(m7l, m7h, r1, s6);
+	MUL64_ACC(m7l, m7h, r2, s5);
+	MUL64_ACC(m7l, m7h, r3, s4);
+	MUL64_ACC(m7l, m7h, r4, s3);
+	MUL64_ACC(m7l, m7h, r5, s2);
+	MUL64_ACC(m7l, m7h, r6, s1);
+	MUL64_ACC(m7l, m7h, r7, s0);
+	MUL64_SET(m9l, m9h, r0, s9);
+	MUL64_ACC(m9l, m9h, r1, s8);
+	MUL64_ACC(m9l, m9h, r2, s7);
+	MUL64_ACC(m9l, m9h, r3, s6);
+	MUL64_ACC(m9l, m9h, r4, s5);
+	MUL64_ACC(m9l, m9h, r5, s4);
+	MUL64_ACC(m9l, m9h, r6, s3);
+	MUL64_ACC(m9l, m9h, r7, s2);
+	MUL64_ACC(m9l, m9h, r8, s1);
+	MUL64_ACC(m9l, m9h, r9, s0);
 
 	r1 *= 2;
 	r3 *= 2;
 	r5 *= 2;
 	r7 *= 2;
 
-	m0 = mul32x32_64(r0, s0);
-	m2 = mul32x32_64(r0, s2) + mul32x32_64(r1, s1) + mul32x32_64(r2, s0);
-	m4 = mul32x32_64(r0, s4) + mul32x32_64(r1, s3) + mul32x32_64(r2, s2) + mul32x32_64(r3, s1) + mul32x32_64(r4, s0);
-	m6 = mul32x32_64(r0, s6) + mul32x32_64(r1, s5) + mul32x32_64(r2, s4) + mul32x32_64(r3, s3) + mul32x32_64(r4, s2) + mul32x32_64(r5, s1) + mul32x32_64(r6, s0);
-	m8 = mul32x32_64(r0, s8) + mul32x32_64(r1, s7) + mul32x32_64(r2, s6) + mul32x32_64(r3, s5) + mul32x32_64(r4, s4) + mul32x32_64(r5, s3) + mul32x32_64(r6, s2) + mul32x32_64(r7, s1) + mul32x32_64(r8, s0);
+	MUL64_SET(m0l, m0h, r0, s0);
+	MUL64_SET(m2l, m2h, r0, s2);
+	MUL64_ACC(m2l, m2h, r1, s1);
+	MUL64_ACC(m2l, m2h, r2, s0);
+	MUL64_SET(m4l, m4h, r0, s4);
+	MUL64_ACC(m4l, m4h, r1, s3);
+	MUL64_ACC(m4l, m4h, r2, s2);
+	MUL64_ACC(m4l, m4h, r3, s1);
+	MUL64_ACC(m4l, m4h, r4, s0);
+	MUL64_SET(m6l, m6h, r0, s6);
+	MUL64_ACC(m6l, m6h, r1, s5);
+	MUL64_ACC(m6l, m6h, r2, s4);
+	MUL64_ACC(m6l, m6h, r3, s3);
+	MUL64_ACC(m6l, m6h, r4, s2);
+	MUL64_ACC(m6l, m6h, r5, s1);
+	MUL64_ACC(m6l, m6h, r6, s0);
+	MUL64_SET(m8l, m8h, r0, s8);
+	MUL64_ACC(m8l, m8h, r1, s7);
+	MUL64_ACC(m8l, m8h, r2, s6);
+	MUL64_ACC(m8l, m8h, r3, s5);
+	MUL64_ACC(m8l, m8h, r4, s4);
+	MUL64_ACC(m8l, m8h, r5, s3);
+	MUL64_ACC(m8l, m8h, r6, s2);
+	MUL64_ACC(m8l, m8h, r7, s1);
+	MUL64_ACC(m8l, m8h, r8, s0);
 
 	r1 *= 19;
 	r2 *= 19;
@@ -1029,21 +1100,68 @@ curve25519_mul( bignum25519 out, const  bignum25519 a, const  bignum25519 b) {
 	r8 *= 19;
 	r9 *= 19;
 
-	m1 += (mul32x32_64(r9, s2) + mul32x32_64(r8, s3) + mul32x32_64(r7, s4) + mul32x32_64(r6, s5) + mul32x32_64(r5, s6) + mul32x32_64(r4, s7) + mul32x32_64(r3, s8) + mul32x32_64(r2, s9));
-	m3 += (mul32x32_64(r9, s4) + mul32x32_64(r8, s5) + mul32x32_64(r7, s6) + mul32x32_64(r6, s7) + mul32x32_64(r5, s8) + mul32x32_64(r4, s9));
-	m5 += (mul32x32_64(r9, s6) + mul32x32_64(r8, s7) + mul32x32_64(r7, s8) + mul32x32_64(r6, s9));
-	m7 += (mul32x32_64(r9, s8) + mul32x32_64(r8, s9));
+	MUL64_ACC(m1l, m1h, r9, s2);
+	MUL64_ACC(m1l, m1h, r8, s3);
+	MUL64_ACC(m1l, m1h, r7, s4);
+	MUL64_ACC(m1l, m1h, r6, s5);
+	MUL64_ACC(m1l, m1h, r5, s6);
+	MUL64_ACC(m1l, m1h, r4, s7);
+	MUL64_ACC(m1l, m1h, r3, s8);
+	MUL64_ACC(m1l, m1h, r2, s9);
+	MUL64_ACC(m3l, m3h, r9, s4);
+	MUL64_ACC(m3l, m3h, r8, s5);
+	MUL64_ACC(m3l, m3h, r7, s6);
+	MUL64_ACC(m3l, m3h, r6, s7);
+	MUL64_ACC(m3l, m3h, r5, s8);
+	MUL64_ACC(m3l, m3h, r4, s9);
+	MUL64_ACC(m5l, m5h, r9, s6);
+	MUL64_ACC(m5l, m5h, r8, s7);
+	MUL64_ACC(m5l, m5h, r7, s8);
+	MUL64_ACC(m5l, m5h, r6, s9);
+	MUL64_ACC(m7l, m7h, r9, s8);
+	MUL64_ACC(m7l, m7h, r8, s9);
 
 	r3 *= 2;
 	r5 *= 2;
 	r7 *= 2;
 	r9 *= 2;
 
-	m0 += (mul32x32_64(r9, s1) + mul32x32_64(r8, s2) + mul32x32_64(r7, s3) + mul32x32_64(r6, s4) + mul32x32_64(r5, s5) + mul32x32_64(r4, s6) + mul32x32_64(r3, s7) + mul32x32_64(r2, s8) + mul32x32_64(r1, s9));
-	m2 += (mul32x32_64(r9, s3) + mul32x32_64(r8, s4) + mul32x32_64(r7, s5) + mul32x32_64(r6, s6) + mul32x32_64(r5, s7) + mul32x32_64(r4, s8) + mul32x32_64(r3, s9));
-	m4 += (mul32x32_64(r9, s5) + mul32x32_64(r8, s6) + mul32x32_64(r7, s7) + mul32x32_64(r6, s8) + mul32x32_64(r5, s9));
-	m6 += (mul32x32_64(r9, s7) + mul32x32_64(r8, s8) + mul32x32_64(r7, s9));
-	m8 += (mul32x32_64(r9, s9));
+	MUL64_ACC(m0l, m0h, r9, s1);
+	MUL64_ACC(m0l, m0h, r8, s2);
+	MUL64_ACC(m0l, m0h, r7, s3);
+	MUL64_ACC(m0l, m0h, r6, s4);
+	MUL64_ACC(m0l, m0h, r5, s5);
+	MUL64_ACC(m0l, m0h, r4, s6);
+	MUL64_ACC(m0l, m0h, r3, s7);
+	MUL64_ACC(m0l, m0h, r2, s8);
+	MUL64_ACC(m0l, m0h, r1, s9);
+	MUL64_ACC(m2l, m2h, r9, s3);
+	MUL64_ACC(m2l, m2h, r8, s4);
+	MUL64_ACC(m2l, m2h, r7, s5);
+	MUL64_ACC(m2l, m2h, r6, s6);
+	MUL64_ACC(m2l, m2h, r5, s7);
+	MUL64_ACC(m2l, m2h, r4, s8);
+	MUL64_ACC(m2l, m2h, r3, s9);
+	MUL64_ACC(m4l, m4h, r9, s5);
+	MUL64_ACC(m4l, m4h, r8, s6);
+	MUL64_ACC(m4l, m4h, r7, s7);
+	MUL64_ACC(m4l, m4h, r6, s8);
+	MUL64_ACC(m4l, m4h, r5, s9);
+	MUL64_ACC(m6l, m6h, r9, s7);
+	MUL64_ACC(m6l, m6h, r8, s8);
+	MUL64_ACC(m6l, m6h, r7, s9);
+	MUL64_ACC(m8l, m8h, r9, s9);
+
+	m0 = MUL64_GET(m0l, m0h);
+	m1 = MUL64_GET(m1l, m1h);
+	m2 = MUL64_GET(m2l, m2h);
+	m3 = MUL64_GET(m3l, m3h);
+	m4 = MUL64_GET(m4l, m4h);
+	m5 = MUL64_GET(m5l, m5h);
+	m6 = MUL64_GET(m6l, m6h);
+	m7 = MUL64_GET(m7l, m7h);
+	m8 = MUL64_GET(m8l, m8h);
+	m9 = MUL64_GET(m9l, m9h);
 
 	                             r0 = (uint32_t)m0 & reduce_mask_26; c = (m0 >> 26);
 	m1 += c;                     r1 = (uint32_t)m1 & reduce_mask_25; c = (m1 >> 25);

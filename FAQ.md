@@ -32,6 +32,12 @@ average. As a rough guide at ~700 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
 ~6 s, 10 nibbles ≈ ~25 min, 12 nibbles ≈ ~4.5 days. The tool prints
 `Estimated attempts: 2^bits` at startup.
 
+Those are averages, not deadlines — the search is memoryless, so being twice
+over the average means nothing is wrong. While hunting the first key the
+progress line shows the actual figure of merit: the chance a match was already
+inside the span searched so far, `1 - (1 - 2^-bits)^attempts`. It crosses 50%
+around the average and 95% at about three times it.
+
 ### Can I match multiple prefixes, a suffix, or a regex?
 Not currently — one prefix per run. The per-candidate cost is dominated by the
 field arithmetic, so extra matching is cheap in principle, but it is not
@@ -66,18 +72,23 @@ driver libs instead, e.g.
 ### `out of memory` at kernel launch?
 Large windows reserve a lot of GPU memory — the driver pins per-thread local
 memory for the SM's full thread capacity (`SM_count × maxThreadsPerSM × W·20`
-bytes), which for big `W` can be several GB. The default auto-fits the window to
-free VRAM and falls back to smaller windows on OOM. If it still fails, lower
-`--blocks` or set a smaller `--window` (e.g. `128` or `64`). Run `--benchmark`
-to see which windows actually fit your GPU (unfitting ones show `OOM/skip`).
+bytes), which for big `W` can be several GB. The default caps itself at `W=2048`
+(~1 GB on a 16-SM GPU) and falls back further on OOM, so you should only see this
+after asking for a big `--window` explicitly. If it still fails, lower `--blocks`
+or set a smaller `--window` (e.g. `128` or `64`). Run `--benchmark` to see which
+windows actually fit your GPU (unfitting ones show `OOM/skip`).
 
 ### Which `--window` (and `--tpb`) should I use?
-Run `--benchmark`: it times every window that fits (~1s each) with the memory
-reserve, then sweeps the block size over the top two windows and prints the exact
-`--window`/`--tpb` to use. Gains above ~1024 are hardware-dependent, so measure
-rather than assume bigger is better — and don't skip the `--tpb` part: the
-kernel needs ~160 registers per thread, so the 64K-registers-per-block limit
-bars `--tpb 512`, and 128 or 384 usually beat the 256 default.
+Mostly you should leave `--window` alone. Since a thread now carries its walk
+across launches, throughput barely depends on the window: past ~1024 the only
+thing left to amortise is one field inversion per window, worth under 1.3% in
+total, while the memory reserve keeps growing with `W`. The default caps at 2048
+for that reason. If you do want the last percent, run `--benchmark`: it times
+every window that fits (~1s each) with the memory reserve, then sweeps the block
+size over the top two windows and prints the exact `--window`/`--tpb` to use.
+Don't skip the `--tpb` part: 128 or 384 usually beat the 256 default. 384 is the hard ceiling (the kernel is pinned
+to 168 registers per thread so a 12-warp block still fits the 64K-registers-
+per-block budget); anything larger is clamped with a message.
 
 ### Is it safe? Is my private key exposed?
 The private key is generated locally on your machine and only printed to stdout —

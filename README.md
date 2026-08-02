@@ -40,7 +40,7 @@ GPU generations.
   -w, --window N    batch/thread: 64…16384 (see below) [auto-fit VRAM]
                     bigger can be faster but reserves much more GPU memory
       --blocks N    CUDA blocks [512]
-      --tpb N       threads per block [256]
+      --tpb N       threads per block, 32…384 [256]
   -d, --device I    CUDA device index [0]
       --no-progress suppress progress output
       --selftest    run correctness self-tests and exit
@@ -53,18 +53,18 @@ the block size over the top two windows, and prints the config to use:
 ```
 $ ./meshcore-vanity --benchmark
 window     Mkeys/s   loc/thr    reserve
-  3072        688.3     60KB    1447MB
-  4096        689.5     80KB    1927MB
-  6144        700.4    120KB    2887MB
-  8192     OOM/skip    160KB    3847MB
+   512        621.9     10KB     246MB
+  1024        633.7     20KB     486MB
+  2048        635.3     40KB     966MB
+  6144        643.5    120KB    2887MB
+  8192     OOM/skip    160KB    3846MB
 ...
 Grid sweep (top windows x block size):
   window     tpb     Mkeys/s
-    6144     128       697.5
-    6144     256       690.4
-    6144     384       703.1
-    6144     512        skip      <- 160 regs/thread x 512 > 64K regs/block
-Fastest: --window 6144 --tpb 384  (703.1 Mkeys/s)
+    6144     128       661.4
+    6144     256       644.1
+    6144     384       682.3
+Fastest: --window 6144 --tpb 384  (682.3 Mkeys/s)
 ```
 
 (The top two windows are swept because the per-block register limit can bar a
@@ -85,6 +85,19 @@ Private Key: E8F0193C0793...FCAB3C31
 Each hex nibble is 4 bits, so an N-nibble prefix takes ~2^(4N) attempts on
 average; the tool prints `Estimated attempts` at startup. One prefix per run —
 launch separate instances for separate prefixes.
+
+While looking for the first key, the progress line also reports how likely it is
+that a match was already inside the span searched so far —
+`1 − (1 − 2^-bits)^attempts`:
+
+```
+Tried 3892314112 keys (282.9 Mkeys/s), 59.6% chance it was already in range
+```
+
+That is the honest way to read a long run: the average is not a deadline, and
+this number tells you where you actually are on the curve. Passing 50% is
+expected roughly at the average; sitting at 95% without a hit is unlucky but not
+evidence anything is wrong.
 
 > The in-kernel filter matches the low 255 bits of the public key (the `y`
 > coordinate). Bit 255 (the `x` parity) is not used for filtering, so the
@@ -182,6 +195,51 @@ indexed byte array — which nvcc lowers to a select chain. Together that is wor
 ~8% of total throughput. Prefixes longer than 8 bytes fall back to the byte
 compare, on a path only a 1-in-2⁶⁴ candidate ever reaches.
 
+### Multiply-accumulate in one instruction
+
+The field multiply is ~100 `32×32→64` products accumulated into ten 64-bit
+lanes. Written as `m += (uint64_t)x*y` that is three SASS instructions per
+product — `IMAD.WIDE.U32` plus an `IADD3`/`IADD3.X` pair for the 64-bit add.
+Expressed as inline PTX `mad.lo.cc.u32` + `madc.hi.u32`, ptxas folds it into a
+single accumulating `IMAD.WIDE.U32`. The hot loop drops from 2760 to 2324
+instructions and throughput rises ~6%. The cost is that every pair passes
+through the one carry flag, so independent accumulators cannot be interleaved as
+freely — this was measured, not assumed. Build with `-DCURVE25519_NO_PTX_MAC` to
+fall back to plain C.
+
+### The walk persists across launches
+
+Setting up a window used to cost a full fixed-base scalar multiplication for the
+thread's centre point plus an inversion to make it affine — about 600 field
+multiplies per thread per launch, paid again every launch. Instead the thread
+**keeps its centre** and advances it by `D = (threads·W·8)·B`, the exact span the
+host adds to its `base` counter, so the two stay in lockstep.
+
+Advancing in affine coordinates needs the two addition denominators `1 ± C`
+(`C = K·xD·yD`), which would normally mean another inversion. Instead the
+step is **seeded into the existing Montgomery chain** — and placed first, so its
+prefix product is the empty product and needs no storage. Once the backward pass
+has stripped every pair, the accumulator is left holding exactly `1/(1−C²)`, and
+both denominators fall out of it with one multiply each:
+
+```
+x' = (x0·yD + y0·xD) / (1 + C)      1/(1+C) = (1 − C)·acc
+y' = (y0·yD + x0·xD) / (1 − C)      1/(1−C) = (1 + C)·acc
+```
+
+Preparing a window therefore costs ~12 multiplies instead of ~600, and not one
+extra live register. The effect is largest where the fixed cost used to dominate:
+
+| window | before | after |
+|---|---|---|
+| 512 | 522 | 645 Mkeys/s |
+| 1024 | 590 | 656 |
+| 2048 | 625 | 658 |
+| 6144 | 645 | 657 |
+
+which is the real point: throughput no longer depends much on `W`, so the window
+can be chosen for its memory footprint instead of its speed.
+
 ### Montgomery batch inversion
 
 All the denominators in a window share a **single** field inversion
@@ -203,9 +261,10 @@ same batch.
 
 ### The batch window (`--window`)
 
-Each window does two per-thread field inversions (one for the window-start
-affine point, one shared Montgomery inversion for the candidates). Bigger
-windows amortize those over more candidates, so throughput can rise with `W`.
+A window now costs exactly one per-thread field inversion — the shared Montgomery
+one (the window-start inversion went away with the persistent walk). A bigger `W`
+amortises that over more candidates, but it is only ~152 multiplies against ~5.5
+per candidate, so past `W=2048` the whole remaining upside is under **1.3%**.
 
 The cost is GPU memory. Each thread's single buffer holds one prefix product per
 ±i **pair**, i.e. `W/2` field elements = `W·20` bytes of local memory, and **the
@@ -226,18 +285,19 @@ though their *live* occupancy is low.
   be chosen closer to what VRAM allows. 16384 is the ceiling, at ~320 KB/thread
   (under the 512 KB local limit); its ~7.7 GB reserve on a 16-SM GPU fits only on
   8 GB+ cards, so on 4 GB cards the practical top is 4096–6144.
-- **default (auto)** selects the largest window whose reserve fits free VRAM;
-  on out-of-memory it auto-falls back to a smaller one.
+- **default (auto)** selects the largest window that fits free VRAM **capped at
+  2048**, since anything beyond that trades a bounded ~1.3% for several times the
+  memory; on out-of-memory it auto-falls back to a smaller one.
 
-The sweet spot is **hardware-dependent**: the per-window inversions are already
-small by ~1024, so on some GPUs larger windows are flat or slightly slower,
-while on others they give a real gain — and whether they fit at all depends on
-VRAM. Use **`--benchmark`**: it measures `Mkeys/s` and the memory reserve for
-every window (unfitting ones show `OOM/skip`), then sweeps the block size over
-the top two windows and prints the `--window`/`--tpb` to use. Do sweep `--tpb`
-too: the kernel uses ~160 registers per thread, so the per-block register budget
-caps the block size below 512, and resident-warps-per-SM granularity makes the
-best block size non-obvious.
+If you want the last percent, use **`--benchmark`**: it measures `Mkeys/s` and
+the memory reserve for every window (unfitting ones show `OOM/skip`), then sweeps
+the block size over the top two windows and prints the `--window`/`--tpb` to use.
+Do sweep `--tpb`
+too: resident-warps-per-SM granularity makes the best block size non-obvious —
+128 and 384 can both beat 256. 384 is the ceiling: a block may use 65536
+registers, allocated per warp in units of 256, and the kernel is pinned by
+`__launch_bounds__` to the 168 registers per thread that let a 12-warp block
+fit. Larger `--tpb` is clamped with a message.
 
 ## Correctness
 
@@ -257,7 +317,12 @@ best block size non-obvious.
 3. **Fast filter vs. reference packing** — the low-64-bit fast path must agree
    with donna's full 32-byte `contract` on 4096 random field elements plus the
    canonicalisation edge cases (`0`, `1`, `p−1`, `p`, `p+1`, `2²⁵⁵−1`).
-4. **Window coverage** — the real search kernel is run with an empty prefix, so
+4. **Persistent walk** — the search kernel is run at `base2` from a cold seed,
+   and separately at `base` and then at `base2` off the state it carried over;
+   with a real prefix the recorded hits depend on the actual points, so the two
+   must agree exactly. Nothing else would catch a drifting walk: the recorded
+   units stay in range whether or not the points are right.
+5. **Window coverage** — the real search kernel is run with an empty prefix, so
    every candidate reports itself and the recorded set is the exact set of
    scalars the window walked. It must be precisely `[0, threads·W)`: no gap, no
    duplicate, no overrun into the neighbouring thread's span. This is what
