@@ -1,17 +1,19 @@
 // meshcore-vanity-cuda — GPU vanity public-key search for MeshCore.
 //
 // Algorithm (see README): pubkey(s+8) = pubkey(s) + 8*B, so instead of a full
-// fixed-base scalar multiplication per candidate we do ONE point addition
-// (P += 8B) and amortize the field inversion over a window of W candidates
-// with Montgomery's batch-inversion trick.
+// fixed-base scalar multiplication per candidate we add a precomputed multiple
+// of 8B to a per-thread centre point, keep only the affine y coordinate, and
+// share one field inversion across a whole window of W candidates with
+// Montgomery's batch-inversion trick.
 //
 // Every thread g has its own random base scalar and, in its k-th launch since
 // that base was drawn, owns candidates s = base_g + (k*W + j)*8, j in [0,W). It
 // walks that span outwards from the centre in +/-i pairs: since -Q = (-x, y),
-// one table entry i*D yields both s = centre +/- 8i, so a window of W candidates
-// needs only W/2 table entries and W/2 batch-inversion slots. The centre point
-// costs a fixed-base multiply only when the base is drawn; after that the
-// thread carries it from launch to launch.
+// one table entry i*D yields both s = centre +/- 8i, and with the d-free
+// addition formula the two denominators multiply to a table lookup and a
+// subtraction, so a pair costs 8 field multiplications. The centre point costs
+// a fixed-base multiply only when the base is drawn; after that the thread
+// carries it from launch to launch.
 
 #include <cstdio>
 #include <cstdlib>
@@ -49,7 +51,7 @@ extern "C" __declspec(dllimport) long __stdcall BCryptGenRandom(void *, unsigned
 // so W=16384 = 320 KB/thread, still under the 512 KB per-thread local limit
 // (numerators and denominators are recomputed, not stored). A bigger window
 // amortizes the one per-window inversion over more candidates, but that is
-// worth under ~1.3% past W=2048 while the VRAM reserve grows with W (at 16384
+// worth about 2% past W=2048 while the VRAM reserve grows with W (at 16384
 // it is ~7.7 GB on a 16-SM GPU); pick one with --window. The 1.5x "half"
 // windows (1536/3072/6144/12288) fill the gaps between powers of two so a size
 // can be chosen closer to what VRAM allows; all are multiples of 512 (a warp is
@@ -114,22 +116,32 @@ __device__ static void ge_to_affine(bignum25519 ax, bignum25519 ay, const ge2551
 }
 
 // -------------------------------------------------------------------------
-// Precompute the step table: affine coords of i*D (D = 8B) for i in [1,WINDOW/2],
-// plus P_i = x_i*y_i (so the hot loop needs no extra mul for the denominator).
-// Only half a window is tabulated because entry i serves both s = centre + 8i
-// and s = centre - 8i (negating a point flips only x).
-// These points are identical for every thread, so this runs once and the main
-// kernel just reads the table (broadcast across the warp). Single thread; the
-// per-point inversion cost is one-time and negligible.
+// The shared step table, for Q_i = i*D (D = 8B), i in [1, W/2]:
+//     x = x_i,  z = 1/y_i,  t = x_i/y_i,  s = t^2
+// which is what the d-free y-only addition in the search kernel reads (see
+// there). Only half a window is tabulated because entry i serves both
+// s = centre + 8i and s = centre - 8i (negating a point flips only x, so it
+// flips x and t and keeps z and s). The entries are identical for every thread,
+// so this runs once and the search kernel just reads it (broadcast across the
+// warp). Single thread; the per-entry inversion is one-time and negligible.
 // -------------------------------------------------------------------------
-__global__ void build_step_table_kernel(bignum25519 *gx, bignum25519 *gy, bignum25519 *gp, int window) {
+struct StepTable { bignum25519 *x, *z, *t, *s; };
+
+__global__ void build_step_table_kernel(StepTable tab, int window) {
     ge25519_niels D; load_step_8B(&D);
     uint8_t eight[32]; for (int k = 0; k < 32; k++) eight[k] = 0; eight[0] = 8;
     ge25519 Q; scalar_to_point(&Q, eight);   // Q = 8B = 1*D
     const int n = window / 2;
     for (int i = 1; i <= n; i++) {
-        ge_to_affine(gx[i], gy[i], &Q);
-        curve25519_mul(gp[i], gx[i], gy[i]);
+        bignum25519 yz, inv;
+        curve25519_mul(yz, Q.y, Q.z);
+        curve25519_recip(inv, yz);                       // 1/(Y Z)
+        curve25519_mul(tab.x[i], Q.x, Q.y);
+        curve25519_mul(tab.x[i], tab.x[i], inv);         // x = X/Z
+        curve25519_mul(tab.z[i], Q.z, Q.z);
+        curve25519_mul(tab.z[i], tab.z[i], inv);         // 1/y = Z/Y
+        curve25519_mul(tab.t[i], tab.x[i], tab.z[i]);    // t = x/y
+        curve25519_square(tab.s[i], tab.t[i]);           // s = t^2
         if (i < n) ge25519_nielsadd2(&Q, &D);            // Q += D
     }
 }
@@ -153,57 +165,22 @@ __global__ void build_launch_step_kernel(bignum25519 *out3, unsigned long long u
 }
 
 // -------------------------------------------------------------------------
-// Low 8 bytes of the compressed encoding of a field element, as one uint64.
+// Low 8 bytes of the compressed encoding of y, for y straight out of
+// curve25519_mul, as one uint64.
 //
 // The filter only ever looks at the first bytes of the key and the encoding is
-// little-endian, so packing all 32 bytes per candidate is waste. The
-// *reduction* cannot be shortened — radix 2^25.5 folds the top of the value
-// back into limb 0 via 2^255 == 19, so the low bits genuinely depend on every
-// limb — but the packing can: after the same canonicalisation
-// curve25519_contract performs, limbs 0..2 cover bits 0..76, and bits 0..63 are
-// exactly f0 | f1<<26 | f2<<51.
-//
-// This mirrors curve25519_contract's reduction; --selftest cross-checks the two
-// against each other on random and edge-case inputs so they cannot drift apart.
+// little-endian, so packing all 32 bytes per candidate is waste — and so is
+// most of the canonicalisation curve25519_contract performs. A multiply leaves
+// every limb within its 26/25 bits except limb 1, which may carry a few bits
+// over (the tail of its reduction), so the represented value is below
+// 2^255 + 2^52 and bits 0..63 are just f0 + f1*2^26 + f2*2^51 (limb 3 starts
+// at bit 77). The value is the canonical y unless it lies in [p, 2^255 + 2^52),
+// i.e. unless y < 2^52 + 19: a chance of about 2^-203 per candidate, in which
+// case a genuine match is missed, never a false one reported (the host
+// re-derives every hit). --selftest checks this against the full contract.
 // -------------------------------------------------------------------------
-__device__ static uint64_t curve25519_contract_lo64(const bignum25519 in) {
-    bignum25519 f;
-    curve25519_copy(f, in);
-
-#define LO64_CARRY() \
-    f[1] += f[0] >> 26; f[0] &= reduce_mask_26; \
-    f[2] += f[1] >> 25; f[1] &= reduce_mask_25; \
-    f[3] += f[2] >> 26; f[2] &= reduce_mask_26; \
-    f[4] += f[3] >> 25; f[3] &= reduce_mask_25; \
-    f[5] += f[4] >> 26; f[4] &= reduce_mask_26; \
-    f[6] += f[5] >> 25; f[5] &= reduce_mask_25; \
-    f[7] += f[6] >> 26; f[6] &= reduce_mask_26; \
-    f[8] += f[7] >> 25; f[7] &= reduce_mask_25; \
-    f[9] += f[8] >> 26; f[8] &= reduce_mask_26;
-#define LO64_CARRY_FULL() LO64_CARRY() f[0] += 19 * (f[9] >> 25); f[9] &= reduce_mask_25;
-
-    LO64_CARRY_FULL()
-    LO64_CARRY_FULL()
-    // Now 0 <= f < 2^255. Offset by 19 to separate the two canonical cases,
-    // add 2^255, carry, and drop the borrow — exactly as curve25519_contract.
-    f[0] += 19;
-    LO64_CARRY_FULL()
-    f[0] += (reduce_mask_26 + 1) - 19;
-    f[1] += (reduce_mask_25 + 1) - 1;
-    f[2] += (reduce_mask_26 + 1) - 1;
-    f[3] += (reduce_mask_25 + 1) - 1;
-    f[4] += (reduce_mask_26 + 1) - 1;
-    f[5] += (reduce_mask_25 + 1) - 1;
-    f[6] += (reduce_mask_26 + 1) - 1;
-    f[7] += (reduce_mask_25 + 1) - 1;
-    f[8] += (reduce_mask_26 + 1) - 1;
-    f[9] += (reduce_mask_25 + 1) - 1;
-    LO64_CARRY()
-    // (f[9] is masked off in contract here; bits >= 255 do not reach the low 64.)
-#undef LO64_CARRY_FULL
-#undef LO64_CARRY
-
-    return (uint64_t)f[0] | ((uint64_t)f[1] << 26) | ((uint64_t)f[2] << 51);
+__device__ __forceinline__ static uint64_t key_lo64(const bignum25519 y) {
+    return (uint64_t)y[0] + ((uint64_t)y[1] << 26) + ((uint64_t)y[2] << 51);
 }
 
 // -------------------------------------------------------------------------
@@ -264,22 +241,28 @@ struct FilterEither {
 // -------------------------------------------------------------------------
 // Main search kernel — affine batched-addition walk in +/-i pairs (y only).
 //
-// For candidate i (scalar s0 + i*8) the point is P0 + i*D. Using the complete
-// twisted-Edwards (a=-1) addition and keeping only y:
-//     y_i = (x0*x_i + y0*y_i) / (1 - d*x0*y0 * x_i*y_i)
-// where (x0,y0) is the window-CENTRE point and (x_i, y_i, P_i=x_i*y_i) come
-// from the shared precomputed step table.
+// Candidate i (scalar centre + 8i) is the point P0 + Q_i, Q_i = i*D from the
+// shared table. Twisted Edwards curves (a = -1) have, besides the complete
+// addition law, a "dedicated" one (Hisil, Wong, Carter, Dawson 2008) whose y
+// does not involve d:
+//     y3 = (x1 y1 - x2 y2) / (x1 y2 - y1 x2)
+// It is exceptional only when x1/y1 = +/-x2/y2, i.e. P0 = +/-Q_i (a 2^-240
+// event for a random base; see below for what that would cost). Divide top and
+// bottom by y0 y_i and write w0 = 1/y0, r0 = x0/y0, E = x0 y0 (per thread) and
+// x = x_i, z = 1/y_i, t = x_i/y_i, s = t^2 (the table):
+//     centre + 8i:  y = w0 (E z - x) / (r0 - t)
+//     centre - 8i:  y = w0 (E z + x) / (r0 + t)     (-Q_i = (-x_i, y_i))
+// The two denominators share one batch-inversion slot, and their product is
+//     (r0 - t)(r0 + t) = R - s,   R = r0^2
+// — a subtraction, no multiply at all. Folding w0 into the one inversion, the
+// split back into the two inverses (one multiply each) directly yields
+// w0/(r0 -/+ t). Per PAIR that is 8 multiplies: 1 forward (prefix product),
+// 2 backward (prefix inverse, strip), E*z, 2 splits and the 2 final products —
+// against 11 multiplies + 2 squarings for the complete formula it replaces.
 //
-// Negating a point flips only x (-Q = (-x, y)), so ONE table entry gives two
-// candidates. With A = x0*x_i, B = y0*y_i and C = K*P_i (K = d*x0*y0, computed
-// once per thread) the pair costs three muls up front:
-//     centre + 8i:  y = (B + A) / (1 - C)
-//     centre - 8i:  y = (B - A) / (1 + C)
-// and, crucially, the two denominators share one batch-inversion slot because
-//     (1 - C)*(1 + C) = 1 - C^2      (one squaring)
-// which is then split back with two muls: 1/(1-C) = (1+C)*inv, and vice versa.
-// That is ~10 muls + 2 squarings per PAIR (~5.5 per candidate, vs ~8 for the
-// one-sided walk) and halves both the local-memory buffer and the step table.
+// If a denominator ever were zero, the whole window's inversion would come out
+// 0 and that thread would find nothing in it (no wrong key can come out: the
+// host re-derives every hit). At 2^-240 per candidate this is not a concern.
 //
 // Occupancy tuning: forcing the register count far down (maxrregcount=128, to
 // unlock tpb=512) was benchmarked and loses — the kernel is ALU-bound, high ILP
@@ -292,18 +275,24 @@ struct FilterEither {
 // build path (Makefile, `make release`, the Windows CI nvcc line) inherits it.
 #define VANITY_MAX_TPB 384
 
+// Per-thread state carried between launches: the window-centre point and 1/y0.
+struct WalkState { bignum25519 *x, *y, *w; };
+
 template <int W, class Filter>
 __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
         const uint8_t *__restrict__ bases,
-        const bignum25519 *__restrict__ gx, const bignum25519 *__restrict__ gy,
-        const bignum25519 *__restrict__ gp,
+        StepTable tab,
         unsigned long long *__restrict__ out_count,
         unsigned long long *__restrict__ out_units,
         const bignum25519 *__restrict__ dstep,
-        bignum25519 *__restrict__ sx, bignum25519 *__restrict__ sy,
+        WalkState st,
         uint8_t *__restrict__ fresh,
         Filter match) {
     const int H = W / 2;
+    const bignum25519 *__restrict__ tx = tab.x;
+    const bignum25519 *__restrict__ tz = tab.z;
+    const bignum25519 *__restrict__ tt = tab.t;
+    const bignum25519 *__restrict__ ts = tab.s;
     const unsigned long long gid =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     // Recorded hits are numbered gid*W + j, j in [0,W) the candidate's place in
@@ -311,36 +300,40 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
     // base_gid + (k*W + j)*8 for the thread's k-th launch on that base.
     const unsigned long long centre_unit = gid * (unsigned long long)W + (unsigned long long)H;
 
-    // The window-centre affine point. When the thread has a fresh base (first
-    // launch, or the host re-drew it after a hit) it costs a fixed-base comb
-    // plus an inversion (~600 field multiplies); otherwise the thread picks up
-    // the point it left behind, advanced by exactly one window (see the tail of
-    // this function).
-    bignum25519 x0, y0;
+    // The window-centre affine point and 1/y0. When the thread has a fresh
+    // base (first launch, or the host re-drew it after a hit) it costs a
+    // fixed-base comb plus one inversion (~600 field multiplies); otherwise the
+    // thread picks up what it left behind, advanced by exactly one window (see
+    // the tail of this function).
+    bignum25519 x0, y0, w0;
     if (fresh[gid]) {
         uint8_t s0[32];
         scalar_add_u64(s0, bases + gid * 32, (unsigned long long)H * 8ULL);
         clamp_scalar(s0);
         ge25519 P;
         scalar_to_point(&P, s0);
-        ge_to_affine(x0, y0, &P);
+        bignum25519 yz, inv;                           // one inversion for all three
+        curve25519_mul(yz, P.y, P.z);
+        curve25519_recip(inv, yz);                     // 1/(Y Z)
+        curve25519_mul(x0, P.x, P.y); curve25519_mul(x0, x0, inv);   // X/Z
+        curve25519_mul(y0, P.y, P.y); curve25519_mul(y0, y0, inv);   // Y/Z
+        curve25519_mul(w0, P.z, P.z); curve25519_mul(w0, w0, inv);   // Z/Y
         fresh[gid] = 0;
     } else {
-        curve25519_copy(x0, sx[gid]);
-        curve25519_copy(y0, sy[gid]);
+        curve25519_copy(x0, st.x[gid]);
+        curve25519_copy(y0, st.y[gid]);
+        curve25519_copy(w0, st.w[gid]);
     }
 
-    // K = d * x0 * y0  (per-thread constant for the denominator).
-    bignum25519 K;
-    curve25519_mul_const(K, x0, ge25519_ecd);
-    curve25519_mul(K, K, y0);
+    // Per-thread constants: r0 = x0/y0, E = x0 y0, R = r0^2.
+    bignum25519 r0, E, R;
+    curve25519_mul(r0, x0, w0);
+    curve25519_mul(E, x0, y0);
+    curve25519_square(R, r0);
 
-    bignum25519 one; for (int k = 0; k < 10; k++) one[k] = 0; one[0] = 1;
-
+    // Every y reaching the filter is a curve25519_mul output, as key_lo64 needs.
     auto check_and_record = [&](const bignum25519 y, unsigned long long unit) {
-        // Matches the low bits of y (bit 255 = x parity is ignored; the host
-        // recomputes the full compressed key for any hit).
-        if (!match(curve25519_contract_lo64(y))) return;
+        if (!match(key_lo64(y))) return;
         unsigned long long slot = atomicAdd(out_count, 1ULL);
         if (slot < RESULT_CAP) out_units[slot] = unit;
     };
@@ -348,104 +341,104 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
     // The centre candidate needs no table entry and no inversion: y = y0.
     check_and_record(y0, centre_unit);
 
-    // Pairs i=1..H (H = W/2): one batch-inversion slot per pair, holding the
-    // PRODUCT of the two denominators. ONLY the prefix products are stored;
-    // C = K*gp_i, the two denominators and the two numerators are all
-    // recomputed in the backward pass from x0,y0,K and the shared table, so a
-    // single H-element buffer holds the whole window. Recomputing costs one
-    // extra mul + one extra squaring per pair, a cheap trade for removing the
-    // local-memory (DRAM) store+load streams and for fitting larger windows.
-    //
-    // The chain is *seeded* with the denominator that advances this thread to
-    // its next window centre, rather than with 1. That slot therefore needs no
-    // stored prefix product (its prefix is the empty product, 1), and after the
-    // backward pass has stripped every pair, `acc` is left holding exactly its
-    // inverse — so the step costs one multiply and one squaring per window and
-    // not a single extra live register. See the tail of the function.
+    // The step to the next window centre, P0 + D with D = (xD, yD, xD yD) =
+    // dstep, uses the same d-free formulas:
+    //     x' = (x0 y0 + xD yD) / (y0 yD - x0 xD)      = (E + PD) / Dx
+    //     y' = (x0 y0 - xD yD) / (x0 yD - y0 xD)      =  Ny / Dy
+    //     w' = 1/y'                                    =  Dy / Ny
+    // Its three denominators seed the batch-inversion chain (as the empty
+    // prefix product, so they need no stored slot), and come back out of the
+    // accumulator at the end. Recomputed there rather than kept live.
+    auto step_dens = [&](bignum25519 Dx, bignum25519 Dy, bignum25519 Ny) {
+        bignum25519 u, v;
+        curve25519_mul(u, y0, dstep[1]); curve25519_mul(v, x0, dstep[0]);
+        curve25519_sub(Dx, u, v);
+        curve25519_mul(u, x0, dstep[1]); curve25519_mul(v, y0, dstep[0]);
+        curve25519_sub(Dy, u, v);
+        curve25519_sub(Ny, E, dstep[2]);
+    };
+
+    // Pairs i = 1..H: one slot per pair holding R - s_i. Only the prefix
+    // products are stored (in local memory); the slot value itself is a
+    // subtraction and is simply redone in the backward pass. Additions and
+    // subtractions stay unreduced (curve25519_add/sub) wherever the result
+    // only feeds a multiply, which accepts the extra headroom.
     bignum25519 pref[W / 2];
     bignum25519 acc;
     {
-        bignum25519 cs, css;
-        curve25519_mul(cs, K, dstep[2]);               // Cs = d x0 y0 xD yD
-        curve25519_square(css, cs);
-        curve25519_sub_reduce(acc, one, css);          // (1-Cs)(1+Cs)
+        bignum25519 Dx, Dy, Ny;
+        step_dens(Dx, Dy, Ny);
+        curve25519_mul(acc, Dx, Dy);
+        curve25519_mul(acc, acc, Ny);
     }
     for (int i = 1; i <= H; i++) {
-        bignum25519 c, cc, prod;
-        curve25519_mul(c, K, gp[i]);                   // C = d x0 y0 x_i y_i
-        curve25519_square(cc, c);
-        curve25519_sub_reduce(prod, one, cc);          // (1-C)(1+C) = 1 - C^2
+        bignum25519 prod;
+        curve25519_sub(prod, R, ts[i]);                // (r0 - t)(r0 + t) = R - s
         curve25519_copy(pref[i - 1], acc);             // prefix product
         curve25519_mul(acc, acc, prod);
     }
-    curve25519_recip(acc, acc);                        // 1 / (step * prod(1 - C^2))
+    curve25519_recip(acc, acc);                        // 1 / (step * prod(R - s))
+    curve25519_mul(acc, acc, w0);                      // ... times w0, for every slot
 
     for (int i = H; i >= 1; i--) {
-        bignum25519 c, cc, prod, invprod, a, b, num, den, y;
-        curve25519_mul(invprod, acc, pref[i - 1]);     // 1 / ((1-C)(1+C))
-        curve25519_mul(c, K, gp[i]);                   // recompute C
-        curve25519_square(cc, c);
-        curve25519_sub_reduce(prod, one, cc);
+        bignum25519 invprod, prod, a, d, n, y;
+        curve25519_mul(invprod, acc, pref[i - 1]);     // w0 / ((r0 - t)(r0 + t))
+        curve25519_sub(prod, R, ts[i]);
         curve25519_mul(acc, acc, prod);                // strip this pair
-        curve25519_mul(a, x0, gx[i]);                  // A = x0 x_i
-        curve25519_mul(b, y0, gy[i]);                  // B = y0 y_i
+        curve25519_mul(a, E, tz[i]);                   // E z
 
-        // centre - 8i : y = (B - A) / (1 + C),  1/(1+C) = (1-C) * invprod
-        curve25519_sub_reduce(den, one, c);
-        curve25519_mul(den, den, invprod);
-        curve25519_sub_reduce(num, b, a);
-        curve25519_mul(y, num, den);
+        // centre - 8i : y = w0 (E z + x) / (r0 + t),  w0/(r0 + t) = (r0 - t) * invprod
+        curve25519_sub(d, r0, tt[i]);
+        curve25519_mul(d, d, invprod);
+        curve25519_add(n, a, tx[i]);
+        curve25519_mul(y, n, d);
         check_and_record(y, centre_unit - (unsigned long long)i);
 
-        // centre + 8i : y = (B + A) / (1 - C),  1/(1-C) = (1+C) * invprod.
+        // centre + 8i : y = w0 (E z - x) / (r0 - t),  w0/(r0 - t) = (r0 + t) * invprod.
         // i == H would land on the next window's first unit, so skip it — the
         // span stays exactly W units wide and windows never overlap.
         if (i < H) {
-            curve25519_add_reduce(den, one, c);
-            curve25519_mul(den, den, invprod);
-            curve25519_add_reduce(num, b, a);
-            curve25519_mul(y, num, den);
+            curve25519_add(d, r0, tt[i]);
+            curve25519_mul(d, d, invprod);
+            curve25519_sub(n, a, tx[i]);
+            curve25519_mul(y, n, d);
             check_and_record(y, centre_unit + (unsigned long long)i);
         }
     }
 
-    // Advance the thread's centre by D = (W * 8) * B, one window, and hand it to
-    // the next launch. Every pair denominator has now been stripped from `acc`,
-    // so what is left is 1/((1-Cs)(1+Cs)) — the seed slot — and the two affine
-    // addition denominators come out of it with one multiply each:
-    //     x' = (x0 yD + y0 xD) / (1 + Cs),   1/(1+Cs) = (1 - Cs) * acc
-    //     y' = (y0 yD + x0 xD) / (1 - Cs),   1/(1-Cs) = (1 + Cs) * acc
+    // Every pair has been stripped, so acc = w0 / (Dx Dy Ny); times y0 it is
+    // the plain inverse of the seed, and each denominator's inverse is the
+    // product of the other two times that.
     {
-        bignum25519 cs, t, u, a, b, num;
-        curve25519_mul(cs, K, dstep[2]);               // recompute Cs
-        curve25519_sub_reduce(t, one, cs);
-        curve25519_add_reduce(u, one, cs);
-        curve25519_mul(t, t, acc);                     // 1 / (1 + Cs)
-        curve25519_mul(u, u, acc);                     // 1 / (1 - Cs)
-        curve25519_mul(a, x0, dstep[1]);               // x0 * yD
-        curve25519_mul(b, y0, dstep[0]);               // y0 * xD
-        curve25519_add_reduce(num, a, b);
-        curve25519_mul(num, num, t);
-        curve25519_copy(sx[gid], num);
-        curve25519_mul(a, y0, dstep[1]);               // y0 * yD
-        curve25519_mul(b, x0, dstep[0]);               // x0 * xD
-        curve25519_add_reduce(num, a, b);
-        curve25519_mul(num, num, u);
-        curve25519_copy(sy[gid], num);
+        bignum25519 Dx, Dy, Ny, inv, t, u;
+        step_dens(Dx, Dy, Ny);
+        curve25519_mul(inv, acc, y0);
+        curve25519_mul(t, Dy, Ny); curve25519_mul(t, t, inv);    // 1/Dx
+        curve25519_add(u, E, dstep[2]);
+        curve25519_mul(u, u, t);
+        curve25519_copy(st.x[gid], u);                            // x'
+        curve25519_mul(t, Dx, Ny); curve25519_mul(t, t, inv);    // 1/Dy
+        curve25519_mul(u, Ny, t);
+        curve25519_copy(st.y[gid], u);                            // y'
+        curve25519_mul(t, Dx, Dy); curve25519_mul(t, t, inv);    // 1/Ny
+        curve25519_mul(u, Dy, t);
+        curve25519_copy(st.w[gid], u);                            // w' = 1/y'
     }
 }
 
 // -------------------------------------------------------------------------
-// Selftest helper: contract both ways so the host can check that the fast
-// low-64-bit packing agrees with donna's full 32-byte contract.
+// Selftest helper: multiply, then pack the product both ways, so the host can
+// check the filter's shortcut against donna's full 32-byte contract.
 // -------------------------------------------------------------------------
-__global__ void contract_lo64_kernel(const bignum25519 *__restrict__ in, int n,
-                                     uint8_t *__restrict__ out32,
-                                     unsigned long long *__restrict__ out_lo) {
+__global__ void mul_lo64_kernel(const bignum25519 *__restrict__ a, const bignum25519 *__restrict__ b,
+                                int n, uint8_t *__restrict__ out32,
+                                unsigned long long *__restrict__ out_lo) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    curve25519_contract(out32 + i * 32, in[i]);
-    out_lo[i] = curve25519_contract_lo64(in[i]);
+    bignum25519 m;
+    curve25519_mul(m, a[i], b[i]);
+    curve25519_contract(out32 + i * 32, m);
+    out_lo[i] = key_lo64(m);
 }
 
 // Host-callable single-key pack: full compressed pubkey (incl. parity) for a
@@ -806,20 +799,38 @@ static void pack_one(const uint8_t scalar[32], uint8_t pub[32],
 // dispatch stays readable.
 struct LaunchArgs {
     const uint8_t *bases;                // per-thread base scalars, 32 bytes each
-    const bignum25519 *gx, *gy, *gp;
+    StepTable tab;                       // shared step table
     unsigned long long *count, *units;
     const bignum25519 *dstep;            // affine (xD, yD, xD*yD) of the launch step
-    bignum25519 *sx, *sy;                // persistent per-thread centre point
+    WalkState st;                        // persistent per-thread centre and 1/y
     uint8_t *fresh;                      // per thread: 1 = seed from its base
 };
+
+// Device allocations for the step table (entries 1..window/2) and the walk
+// state. Return false on failure, leaving what was allocated to the free call.
+static bool alloc_table(StepTable &t, int window) {
+    const size_t b = sizeof(bignum25519) * (size_t)(window / 2 + 1);
+    t = StepTable{nullptr, nullptr, nullptr, nullptr};
+    return cudaMalloc(&t.x, b) == cudaSuccess && cudaMalloc(&t.z, b) == cudaSuccess &&
+           cudaMalloc(&t.t, b) == cudaSuccess && cudaMalloc(&t.s, b) == cudaSuccess;
+}
+static void free_table(StepTable &t) { cudaFree(t.x); cudaFree(t.z); cudaFree(t.t); cudaFree(t.s); }
+
+static bool alloc_state(WalkState &w, unsigned long long threads) {
+    const size_t b = sizeof(bignum25519) * threads;
+    w = WalkState{nullptr, nullptr, nullptr};
+    return cudaMalloc(&w.x, b) == cudaSuccess && cudaMalloc(&w.y, b) == cudaSuccess &&
+           cudaMalloc(&w.w, b) == cudaSuccess;
+}
+static void free_state(WalkState &w) { cudaFree(w.x); cudaFree(w.y); cudaFree(w.w); }
 
 // Launch the vanity kernel instantiation for a runtime window and filter.
 // Returns the launch error (e.g. cudaErrorMemoryAllocation if the local frame
 // won't fit).
 template <class F>
 static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchArgs &a, const F &f) {
-#define LV(W) case W: vanity_kernel<W, F><<<blocks, tpb>>>(a.bases, a.gx, a.gy, a.gp, \
-                  a.count, a.units, a.dstep, a.sx, a.sy, a.fresh, f); break;
+#define LV(W) case W: vanity_kernel<W, F><<<blocks, tpb>>>(a.bases, a.tab, a.count, a.units, \
+                  a.dstep, a.st, a.fresh, f); break;
     switch (window) {
         LV(16384) LV(12288) LV(8192) LV(6144) LV(4096) LV(3072) LV(2048)
         LV(1536) LV(1024) LV(512) LV(256) LV(128) LV(64)
@@ -869,9 +880,9 @@ static size_t window_reserve_bytes(int window, int numSM, int maxThreadsSM) {
 // per-window fixed-base multiply and its inversion used to cost ~600 field
 // multiplies per thread per launch, which only a large W could amortise; now a
 // thread carries its centre across launches and pays ~12. What is left that
-// still scales with W is the single Montgomery inversion, ~152 multiplies per
-// window against ~5.5 per candidate — so going past 2048 can buy at most
-// 152/2048/5.5 ≈ 1.3%, while the memory reserve grows in proportion to W. That
+// still scales with W is the single Montgomery inversion, ~180 multiplies per
+// window against ~4 per candidate — so going past 2048 can buy at most
+// 180/2048/4 ≈ 2%, while the memory reserve grows in proportion to W. That
 // bound is arithmetic, not hardware-specific. --window and --benchmark are
 // still there for anyone who wants to chase the last percent.
 #define AUTO_WINDOW_CAP 2048
@@ -947,7 +958,7 @@ int main(int argc, char **argv) {
                    "      --repeat-byte N   key starts with N+ identical bytes (ABABAB..)\n"
                    "  -l, --limit N     stop after N matches total (0 = infinite) [1]\n"
                    "  -w, --window N    batch/thr: 64..16384 incl. 1536/3072/6144/12288 [auto VRAM]\n"
-                   "                    past ~2048 at most ~1.3%% faster, but much more GPU memory\n"
+                   "                    past ~2048 at most ~2%% faster, but much more GPU memory\n"
                    "      --blocks N    CUDA blocks [512]\n"
                    "      --tpb N       threads per block, 32..384 [256]\n"
                    "  -d, --device I    CUDA device index [0]\n"
@@ -1050,14 +1061,10 @@ int main(int argc, char **argv) {
     cuda_check(cudaMalloc(&d_scalar, 32), "malloc scalar");
     cuda_check(cudaMalloc(&d_pub, 32), "malloc pub");
 
-    // Shared precomputed step table i*D (affine x, y and x*y), i in [1,window/2].
-    // Allocated for the largest window, so a fallback to a smaller one can
-    // rebuild it in place.
-    const size_t tbl = (size_t)(window / 2) + 1;
-    bignum25519 *d_gx, *d_gy, *d_gp;
-    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * tbl), "malloc gx");
-    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * tbl), "malloc gy");
-    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * tbl), "malloc gp");
+    // Shared precomputed step table, sized for the starting window, so a
+    // fallback to a smaller one can rebuild it in place.
+    StepTable d_tab;
+    if (!alloc_table(d_tab, window)) cuda_check(cudaGetLastError(), "malloc step table");
 
     // The filter for this set of criteria. Each combination is its own kernel,
     // so a mode never pays for checks it does not use.
@@ -1073,18 +1080,18 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> h_bases(threads * 32);
     std::vector<unsigned long long> h_seeded(threads, 0);
     uint8_t *d_bases, *d_fresh;
-    bignum25519 *d_sx, *d_sy, *d_dstep;
+    WalkState d_st;
+    bignum25519 *d_dstep;
     cuda_check(cudaMalloc(&d_bases, threads * 32), "malloc bases");
     cuda_check(cudaMalloc(&d_fresh, threads), "malloc fresh");
-    cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * threads), "malloc state x");
-    cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * threads), "malloc state y");
+    if (!alloc_state(d_st, threads)) cuda_check(cudaGetLastError(), "malloc walk state");
     cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "malloc dstep");
 
     unsigned long long launch_no = 0;
     // (Re)build everything that depends on the window, and give every thread a
     // fresh random base.
     auto setup_window = [&]() {
-        build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
+        build_step_table_kernel<<<1, 1>>>(d_tab, window);
         cuda_check(cudaGetLastError(), "build_step_table launch");
         build_launch_step_kernel<<<1, 1>>>(d_dstep, (unsigned long long)window);
         cuda_check(cudaGetLastError(), "build_launch_step launch");
@@ -1097,7 +1104,7 @@ int main(int argc, char **argv) {
     };
     setup_window();
 
-    const LaunchArgs la{d_bases, d_gx, d_gy, d_gp, d_count, d_units, d_dstep, d_sx, d_sy, d_fresh};
+    const LaunchArgs la{d_bases, d_tab, d_count, d_units, d_dstep, d_st, d_fresh};
     auto launch = [&]() -> cudaError_t {
         if (nrule == 0)
             return npfx == 1 ? launch_vanity(window, blocks, tpb, la, f_one)
@@ -1282,8 +1289,9 @@ struct Rig {
     unsigned long long thr;
     uint8_t *d_bases = nullptr, *d_fresh = nullptr;
     unsigned long long *d_count = nullptr, *d_units = nullptr;
-    bignum25519 *d_gx = nullptr, *d_gy = nullptr, *d_gp = nullptr;
-    bignum25519 *d_sx = nullptr, *d_sy = nullptr, *d_dstep = nullptr;
+    StepTable tab{nullptr, nullptr, nullptr, nullptr};
+    WalkState st{nullptr, nullptr, nullptr};
+    bignum25519 *d_dstep = nullptr;
     std::vector<uint8_t> bases;          // per-thread base scalars (host copy)
     bool ok = true;                      // allocations and precompute succeeded
     bool oom = false;                    // a launch ran out of memory
@@ -1293,25 +1301,23 @@ struct Rig {
         auto m = [&](void *p, size_t n) {
             if (ok && cudaMalloc((void **)p, n) != cudaSuccess) { cudaGetLastError(); ok = false; }
         };
-        const size_t tbl = sizeof(bignum25519) * (w / 2 + 1);
         m(&d_bases, thr * 32); m(&d_fresh, thr);
         m(&d_count, sizeof(unsigned long long));
         m(&d_units, sizeof(unsigned long long) * RESULT_CAP);
-        m(&d_gx, tbl); m(&d_gy, tbl); m(&d_gp, tbl);
-        m(&d_sx, sizeof(bignum25519) * thr); m(&d_sy, sizeof(bignum25519) * thr);
+        if (ok && !alloc_table(tab, w)) { cudaGetLastError(); ok = false; }
+        if (ok && !alloc_state(st, thr)) { cudaGetLastError(); ok = false; }
         m(&d_dstep, sizeof(bignum25519) * 3);
         bases.resize(thr * 32);
         random_bases(bases.data(), thr);
         if (!ok) return;
-        build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, w);
+        build_step_table_kernel<<<1, 1>>>(tab, w);
         build_launch_step_kernel<<<1, 1>>>(d_dstep, (unsigned long long)w);
         if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); ok = false; return; }
         upload();
     }
     ~Rig() {
         cudaFree(d_bases); cudaFree(d_fresh); cudaFree(d_count); cudaFree(d_units);
-        cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
-        cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_dstep);
+        free_table(tab); free_state(st); cudaFree(d_dstep);
     }
     Rig(const Rig &) = delete;
     Rig &operator=(const Rig &) = delete;
@@ -1324,7 +1330,7 @@ struct Rig {
     template <class F>
     cudaError_t launch(const F &f) {
         cudaMemset(d_count, 0, sizeof(unsigned long long));
-        LaunchArgs la{d_bases, d_gx, d_gy, d_gp, d_count, d_units, d_dstep, d_sx, d_sy, d_fresh};
+        LaunchArgs la{d_bases, tab, d_count, d_units, d_dstep, st, d_fresh};
         return launch_vanity(window, blocks, tpb, la, f);
     }
 
@@ -1357,40 +1363,41 @@ struct Rig {
 };
 
 // -------------------------------------------------------------------------
-// Self-test: the fast low-64-bit packing must agree with donna's full contract
-// on random field elements plus the canonicalisation edge cases (0, 1, p-1, p,
-// p+1, 2^255-1), which is where a hand-rolled reduction would go wrong.
+// Self-test: key_lo64 on multiply outputs must give the low 8 bytes of the
+// canonical encoding, for products of random field elements and of the
+// canonicalisation edge cases (0, 1, p-1, p, p+1, 2^255-1). The one allowed
+// disagreement is the documented miss: canonical y below 2^52 + 19, where the
+// multiply can leave y + p. Real candidates hit that with probability ~2^-203;
+// here the inputs = 0 mod p and the other edge cases produce it on purpose.
 // -------------------------------------------------------------------------
-static int check_contract_lo64() {
+static int check_key_lo64() {
     const uint32_t m26 = (1u << 26) - 1, m25 = (1u << 25) - 1;
-    std::vector<std::array<uint32_t, 10>> v;
-    auto push = [&](std::array<uint32_t, 10> f) { v.push_back(f); };
+    typedef std::array<uint32_t, 10> Fe;
     auto full = [&](uint32_t lo0) {   // limb0 = lo0, all higher limbs saturated
-        std::array<uint32_t, 10> f{};
+        Fe f{};
         f[0] = lo0;
         for (int k = 1; k < 10; k++) f[k] = (k & 1) ? m25 : m26;
         return f;
     };
-    push({0,0,0,0,0,0,0,0,0,0});
-    push({1,0,0,0,0,0,0,0,0,0});
-    push(full(m26 - 20));             // p - 1
-    push(full(m26 - 19));             // p     -> must canonicalise to 0
-    push(full(m26 - 18));             // p + 1 -> 1
-    push(full(m26));                  // 2^255 - 1
+    // p = 2^255 - 19 is limb0 = 2^26 - 19 = m26 - 18 with every other limb full.
+    std::vector<Fe> edge = {Fe{}, Fe{1}, full(m26 - 19) /* p-1 */, full(m26 - 18) /* p */,
+                            full(m26 - 17) /* p+1 */, full(m26) /* 2^255-1 */};
+    std::vector<Fe> va, vb;
+    for (const Fe &x : edge) for (const Fe &y : edge) { va.push_back(x); vb.push_back(y); }
     std::mt19937 rng(12345);
-    for (int i = 0; i < 4096; i++) {
-        std::array<uint32_t, 10> f{};
-        for (int k = 0; k < 10; k++) f[k] = rng() & ((k & 1) ? m25 : m26);
-        push(f);
-    }
+    auto rnd = [&]() { Fe f; for (int k = 0; k < 10; k++) f[k] = rng() & ((k & 1) ? m25 : m26); return f; };
+    for (int i = 0; i < 4096; i++) { va.push_back(rnd()); vb.push_back(i & 1 ? rnd() : edge[(i / 2) % 6]); }
 
-    const int n = (int)v.size();
-    uint32_t *d_in; uint8_t *d_out32; unsigned long long *d_lo;
-    cuda_check(cudaMalloc(&d_in, sizeof(uint32_t) * 10 * n), "malloc lo64 in");
+    const int n = (int)va.size();
+    uint32_t *d_a, *d_b; uint8_t *d_out32; unsigned long long *d_lo;
+    cuda_check(cudaMalloc(&d_a, sizeof(Fe) * n), "malloc lo64 a");
+    cuda_check(cudaMalloc(&d_b, sizeof(Fe) * n), "malloc lo64 b");
     cuda_check(cudaMalloc(&d_out32, 32 * n), "malloc lo64 out32");
     cuda_check(cudaMalloc(&d_lo, sizeof(unsigned long long) * n), "malloc lo64 lo");
-    cuda_check(cudaMemcpy(d_in, v.data(), sizeof(uint32_t) * 10 * n, cudaMemcpyHostToDevice), "memcpy lo64");
-    contract_lo64_kernel<<<(n + 127) / 128, 128>>>((const bignum25519 *)d_in, n, d_out32, d_lo);
+    cuda_check(cudaMemcpy(d_a, va.data(), sizeof(Fe) * n, cudaMemcpyHostToDevice), "memcpy lo64 a");
+    cuda_check(cudaMemcpy(d_b, vb.data(), sizeof(Fe) * n, cudaMemcpyHostToDevice), "memcpy lo64 b");
+    mul_lo64_kernel<<<(n + 127) / 128, 128>>>((const bignum25519 *)d_a, (const bignum25519 *)d_b,
+                                              n, d_out32, d_lo);
     cuda_check(cudaGetLastError(), "lo64 launch");
     cuda_check(cudaDeviceSynchronize(), "lo64 sync");
 
@@ -1398,15 +1405,21 @@ static int check_contract_lo64() {
     std::vector<unsigned long long> lo(n);
     cuda_check(cudaMemcpy(out32.data(), d_out32, 32 * n, cudaMemcpyDeviceToHost), "copy out32");
     cuda_check(cudaMemcpy(lo.data(), d_lo, sizeof(unsigned long long) * n, cudaMemcpyDeviceToHost), "copy lo");
-    cudaFree(d_in); cudaFree(d_out32); cudaFree(d_lo);
+    cudaFree(d_a); cudaFree(d_b); cudaFree(d_out32); cudaFree(d_lo);
 
-    int fails = 0;
+    int fails = 0, small = 0;
     for (int i = 0; i < n; i++) {
+        const uint8_t *c = &out32[i * 32];
         unsigned long long want = 0;
-        for (int b = 0; b < 8; b++) want |= (unsigned long long)out32[i * 32 + b] << (8 * b);
-        if (want != lo[i]) fails++;
+        for (int b = 0; b < 8; b++) want |= (unsigned long long)c[b] << (8 * b);
+        if (want == lo[i]) continue;
+        bool tiny = want < (1ULL << 52) + 19;
+        for (int b = 8; b < 32; b++) tiny = tiny && c[b] == 0;
+        if (tiny) small++; else fails++;
     }
-    printf("[selftest] contract_lo64 == low 8 bytes of contract: %d/%d ok\n", n - fails, n);
+    printf("[selftest] filter bits == low 8 bytes of contract: %d/%d products ok"
+           " (+%d forced y < 2^52 left as y + p, the documented miss)\n",
+           n - fails - small, n, small);
     return fails;
 }
 
@@ -1466,6 +1479,48 @@ static int check_persistent_walk(int window, int blocks, int tpb) {
     printf("[selftest] window %5d persistent walk == cold seed: %s (%zu vs %zu hits)\n",
            window, ok ? "identical" : "BROKEN", cold.size(), warm.size());
     return ok ? 0 : 1;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: ground truth. The other kernel tests compare the kernel with
+// itself (cold seed vs carried walk, list vs single prefix), so an addition
+// formula that produced consistent but wrong y values would pass all of them.
+// Here every candidate of a small grid is recomputed independently — full
+// fixed-base scalar multiplication, projective, packed by donna — and the set
+// of candidates whose key has a given hex digit must be exactly the set the
+// kernel records: nothing missed, nothing invented. Checked for a cold launch
+// and for the next one off the carried state.
+// -------------------------------------------------------------------------
+static int check_ground_truth(int window, int blocks, int tpb) {
+    fresh_context();
+    Rig r(window, blocks, tpb);
+    const FilterOne f{0x0A, 0x0F};                  // second hex digit is A: 1 in 16
+    uint8_t *d_scalar, *d_pub;
+    cuda_check(cudaMalloc(&d_scalar, 32), "gt malloc scalar");
+    cuda_check(cudaMalloc(&d_pub, 32), "gt malloc pub");
+
+    int fails = 0;
+    size_t hits = 0;
+    for (int launch = 0; launch < 2; launch++) {
+        std::vector<unsigned long long> got = r.run(f, launch == 0);
+        if (r.skipped("ground truth")) { cudaFree(d_scalar); cudaFree(d_pub); return 0; }
+        std::vector<unsigned long long> want;
+        for (unsigned long long g = 0; g < r.thr; g++)
+            for (int j = 0; j < window; j++) {
+                uint8_t scalar[32], pub[32];
+                scalar_add_u64(scalar, &r.bases[g * 32],
+                               ((unsigned long long)launch * window + j) * 8ULL);
+                clamp_scalar(scalar);
+                pack_one(scalar, pub, d_scalar, d_pub);
+                if ((pub[0] & 0x0F) == 0x0A) want.push_back(g * window + j);
+            }
+        hits += want.size();
+        if (want.empty() || got != want) fails++;
+    }
+    cudaFree(d_scalar); cudaFree(d_pub);
+    printf("[selftest] window %5d kernel == independent s*B for %llu candidates x 2 launches: %s (%zu hits)\n",
+           window, r.thr * (unsigned long long)window, fails ? "BROKEN" : "exact", hits);
+    return fails;
 }
 
 // -------------------------------------------------------------------------
@@ -1654,13 +1709,15 @@ static int run_selftest() {
                         kat_got.c_str(), kat_want.c_str());
     fails += !kat_ok;
 
-    fails += check_contract_lo64();
+    fails += check_key_lo64();
     fails += check_probability();
     // A power-of-two window, a "half" window, and >1 thread so the boundary
     // between neighbouring spans is actually exercised.
     fails += check_window_coverage(64, 2, 2);
     fails += check_window_coverage(1024, 1, 2);
     fails += check_window_coverage(1536, 1, 2);
+    fails += check_ground_truth(256, 1, 4);
+    fails += check_ground_truth(1536, 1, 2);
     fails += check_persistent_walk(256, 8, 64);
     fails += check_persistent_walk(1536, 4, 32);
     fails += check_prefix_list(256, 8, 64);

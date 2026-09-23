@@ -44,7 +44,7 @@ GPU generations.
       --repeat-byte N   key starts with N+ identical bytes (ABABAB…)
   -l, --limit N     stop after N matches total (0 = infinite) [1]
   -w, --window N    batch/thread: 64…16384 (see below) [auto-fit VRAM]
-                    past ~2048 at most ~1.3% faster, but much more GPU memory
+                    past ~2048 at most ~2% faster, but much more GPU memory
       --blocks N    CUDA blocks [512]
       --tpb N       threads per block, 32…384 [256]
   -d, --device I    CUDA device index [0]
@@ -196,69 +196,98 @@ donna's base-multiples table, so the step constant is free.
 
 The only expensive part left is the field inversion needed to read off the
 affine `y` coordinate. Instead of a sequential projective walk, precompute the
-affine multiples `i·D` **once** (they are identical for every thread) and
-compute each candidate independently as `P0 + i·D`. Because a match only needs
-the `y` bytes, use the complete twisted-Edwards (a = −1) addition and keep
-**only `y`**:
+affine multiples `Q_i = i·D` **once** (they are identical for every thread) and
+compute each candidate independently as `P0 + Q_i`, sharing one inversion
+across the whole window (see *Montgomery batch inversion*). A match only needs
+the `y` bytes, so keep **only `y`** — and use the addition law that makes that
+cheapest.
+
+Twisted Edwards curves (`a = −1`) have, besides the complete addition law, a
+*dedicated* one (Hisil, Wong, Carter, Dawson, [*Twisted Edwards Curves
+Revisited*](https://eprint.iacr.org/2008/522.pdf), 2008) whose `y` does not
+involve `d` at all:
 
 ```
-y_i = (x0·x_i + y0·y_i) / (1 − d·x0·y0·x_i·y_i)
+y3 = (x1·y1 − x2·y2) / (x1·y2 − y1·x2)
 ```
 
-With `K = d·x0·y0` computed once per thread and `P_i = x_i·y_i` precomputed in
-the shared table, each candidate is: `num = x0·x_i + y0·y_i` (2 mults),
-`den = 1 − K·P_i` (1 mult), a shared batch inversion (~3 mults amortized), and
-`y = num·inv` (1 mult) — the `x` coordinate is never computed. That's ~7 field
-multiplies per candidate instead of hundreds of point operations.
+Divide top and bottom by `y0·y_i`, and let each thread keep `w0 = 1/y0`,
+`r0 = x0/y0`, `E = x0·y0`, while the table holds `x_i`, `z_i = 1/y_i`,
+`t_i = x_i/y_i` and `s_i = t_i²`:
+
+```
+y = w0·(E·z_i − x_i) / (r0 − t_i)
+```
+
+It is exceptional only when `P0 = ±Q_i` — for a random base, a 2⁻²⁴⁰ event,
+and even then it would only make one thread find nothing in one window (every
+hit is re-derived on the host, so no wrong key can come out).
 
 ### Walking the window in ±i pairs
 
-Negating an Edwards point flips only `x`: `−Q = (−x, y)`. So one table entry
-`i·D` serves **two** candidates at once if the thread's window is walked
-outwards from its centre instead of forwards from its start. Writing
-`A = x0·x_i`, `B = y0·y_i` and `C = K·P_i` (three mults, shared by the pair):
+Negating an Edwards point flips only `x`: `−Q = (−x, y)`, which flips `x_i` and
+`t_i` and keeps `z_i` and `s_i`. So one table entry serves **two** candidates if
+the thread's window is walked outwards from its centre instead of forwards from
+its start:
 
 ```
-centre + 8i:   y = (B + A) / (1 − C)
-centre − 8i:   y = (B − A) / (1 + C)
+centre + 8i:   y = w0·(E·z_i − x_i) / (r0 − t_i)
+centre − 8i:   y = w0·(E·z_i + x_i) / (r0 + t_i)
 ```
 
-The two denominators then collapse into **one** batch-inversion slot, because
+The two denominators share **one** batch-inversion slot, and their product costs
+nothing:
 
 ```
-(1 − C)·(1 + C) = 1 − C²          — a single squaring
+(r0 − t_i)·(r0 + t_i) = R − s_i        R = r0², s_i from the table
 ```
 
-and the joint inverse is split back apart with two mults
-(`1/(1−C) = (1+C)·inv`, and symmetrically). Per pair that is ~10 mults + 2
-squarings — about **5.5 mults per candidate instead of 8** — and it halves both
-the per-thread buffer and the precomputed table, which is what lets much larger
-windows fit in VRAM.
+`w0` is folded into the single inversion, so splitting the slot's inverse back
+apart with one multiply each (`w0/(r0 − t) = (r0 + t)·inv`, and symmetrically)
+yields the whole factor `w0/(r0 ∓ t)` at once. Per pair that is **8 multiplies
+and no squarings**: 1 forward (prefix product), 2 backward (prefix inverse,
+strip), `E·z_i`, 2 splits and the 2 final products — 4 per candidate. The
+pairing also halves both the per-thread buffer and the precomputed table, which
+is what lets large windows fit in VRAM.
+
+The first version used the complete formula, `y = (x0·x_i + y0·y_i) / (1 −
+d·x0·y0·x_i·y_i)`, where the pair's denominators multiply to `1 − C²`: 11
+multiplies and 2 squarings per pair. The d-free walk cut the hot loop from 2459
+to 1597 instructions per pair and made the search **~35% faster** (RTX 3050
+Laptop, window 2048, measured A/B on an idle GPU; together with the filter
+below, ~40%).
 
 ### Recompute instead of store
 
 The per-window buffer lives in **local memory (off-chip DRAM)**, so anything
 stored there is a full store+load stream per thread. Only the batch-inversion
-prefix products actually have to be kept: `C`, both denominators and both
-numerators are **recomputed** in the backward pass from `x0,y0,K` and the
-L2-cached shared table. That leaves a single `W/2`-element buffer for a
-`W`-candidate window. Recomputing costs one extra mult + one extra squaring per
-pair, and is net *faster* — cheap ALU and cached table reads in exchange for
-expensive local-memory traffic.
+prefix products actually have to be kept: the slot value `R − s_i` is a
+subtraction and is simply redone in the backward pass, and numerators and
+split factors come from `r0, E` and the L2-cached shared table. That leaves a
+single `W/2`-element buffer for a `W`-candidate window.
+
+Additions and subtractions whose result only feeds a multiply stay unreduced:
+the multiply accepts limbs with a couple of bits of headroom, so the carry
+chain after them is wasted work.
 
 ### Checking the prefix without packing the key
 
-Every candidate has to be filtered, so the filter itself is on the hot path. Two
-things make it nearly free. The encoding is little-endian, so the prefix lives in
-the **low** bytes: after the same canonical reduction `contract` performs (which
-cannot be skipped — radix 2²⁵·⁵ folds the top of the value back into limb 0 via
-`2²⁵⁵ ≡ 19`, so the low bits depend on every limb), the low 8 bytes are just
-`f0 | f1<<26 | f2<<51`, and the other 24 bytes are never assembled. And the
-prefix itself is packed host-side into one `req`/`mask` pair of 64-bit words, so
-the test is a single `(y ^ req) & mask` instead of a loop over a dynamically
-indexed byte array — which nvcc lowers to a select chain. Together that is worth
-~8% of total throughput. Prefixes longer than 8 bytes fall back to the byte
-compare, on a path only a 1-in-2⁶⁴ candidate ever reaches.
+Every candidate has to be filtered, so the filter itself is on the hot path. The
+encoding is little-endian, so the prefix lives in the **low** bytes. A field
+multiply leaves every limb within its 26/25 bits except limb 1, which may carry
+a few bits over, so the value it returns is below `2²⁵⁵ + 2⁵²` and its low 8
+bytes are just `f0 + f1·2²⁶ + f2·2⁵¹`: no canonical reduction, no packing. That
+value is the canonical `y` unless it lies in `[p, 2²⁵⁵ + 2⁵²)`, i.e. unless
+`y < 2⁵² + 19` — a 2⁻²⁰³ chance per candidate, in which case a match would be
+missed, never a false one reported. Every `y` the kernel filters is a multiply
+output, so this holds throughout. (Doing the full `contract` reduction first
+costs ~4% of throughput.)
+
+The prefix itself is packed host-side into one `req`/`mask` pair of 64-bit
+words, so the test is a single `(y ^ req) & mask` instead of a loop over a
+dynamically indexed byte array — which nvcc lowers to a select chain. Prefixes
+longer than 8 bytes are checked in full on the host, for the 1-in-2⁶⁴ candidates
+that pass the first 8.
 
 ### Multiply-accumulate in one instruction
 
@@ -281,20 +310,24 @@ multiplies per thread per launch, paid again every launch. Instead the thread
 counts the thread's launches since its base was drawn, so the two stay in
 lockstep.
 
-Advancing in affine coordinates needs the two addition denominators `1 ± C`
-(`C = K·xD·yD`), which would normally mean another inversion. Instead the
-step is **seeded into the existing Montgomery chain** — and placed first, so its
-prefix product is the empty product and needs no storage. Once the backward pass
-has stripped every pair, the accumulator is left holding exactly `1/(1−C²)`, and
-both denominators fall out of it with one multiply each:
+Advancing in affine coordinates, and keeping `w0 = 1/y0` for the next window,
+needs three denominators — which would normally mean another inversion. Instead
+the step is **seeded into the existing Montgomery chain** — and placed first, so
+its prefix product is the empty product and needs no storage. With the same
+d-free formulas:
 
 ```
-x' = (x0·yD + y0·xD) / (1 + C)      1/(1+C) = (1 − C)·acc
-y' = (y0·yD + x0·xD) / (1 − C)      1/(1−C) = (1 + C)·acc
+x' = (x0·y0 + xD·yD) / (y0·yD − x0·xD)      = (E + PD) / Dx
+y' = (x0·y0 − xD·yD) / (x0·yD − y0·xD)      =  Ny / Dy
+w' = 1/y'                                   =  Dy / Ny
 ```
 
-Preparing a window therefore costs ~12 multiplies instead of ~600, and not one
-extra live register. The effect is largest where the fixed cost used to dominate:
+Once the backward pass has stripped every pair, the accumulator holds
+`w0/(Dx·Dy·Ny)`; one multiply by `y0` makes it the plain inverse, and each
+denominator's inverse is the product of the other two times that. Preparing a
+window therefore costs ~25 multiplies instead of ~600, and no extra live
+register. The effect (measured with the earlier complete-formula walk) is largest
+where the fixed cost used to dominate:
 
 | window | before | after |
 |---|---|---|
@@ -341,8 +374,8 @@ half — never on the GPU path — so this costs no throughput.
 
 A window now costs exactly one per-thread field inversion — the shared Montgomery
 one (the window-start inversion went away with the persistent walk). A bigger `W`
-amortises that over more candidates, but it is only ~152 multiplies against ~5.5
-per candidate, so past `W=2048` the whole remaining upside is under **1.3%**.
+amortises that over more candidates, but it is only ~180 multiplies against ~4
+per candidate, so past `W=2048` the whole remaining upside is about **2%**.
 
 The cost is GPU memory. Each thread's single buffer holds one prefix product per
 ±i **pair**, i.e. `W/2` field elements = `W·20` bytes of local memory, and **the
@@ -364,7 +397,7 @@ though their *live* occupancy is low.
   (under the 512 KB local limit); its ~7.7 GB reserve on a 16-SM GPU fits only on
   8 GB+ cards, so on 4 GB cards the practical top is 4096–6144.
 - **default (auto)** selects the largest window that fits free VRAM **capped at
-  2048**, since anything beyond that trades a bounded ~1.3% for several times the
+  2048**, since anything beyond that trades a bounded ~2% for several times the
   memory; on out-of-memory it auto-falls back to a smaller one.
 
 If you want the last percent, use **`--benchmark`**: it measures `Mkeys/s` and
@@ -393,31 +426,40 @@ fit. Larger `--tpb` is clamped with a message.
    pubkey CFE058A4A189EE7230E43A1347EA1A7EEF01F3557991A7FD3CEC8915FD290AEC
    ```
 
-3. **Fast filter vs. reference packing** — the low-64-bit fast path must agree
-   with donna's full 32-byte `contract` on 4096 random field elements plus the
-   canonicalisation edge cases (`0`, `1`, `p−1`, `p`, `p+1`, `2²⁵⁵−1`).
-4. **Prefix list** — searching a list of mixed-length prefixes finds exactly
+3. **Fast filter vs. reference packing** — on multiply outputs, the filter's
+   low 64 bits must agree with donna's full 32-byte `contract` for products of
+   random field elements and of the edge cases (`0`, `1`, `p−1`, `p`, `p+1`,
+   `2²⁵⁵−1`); the only allowed difference is the documented `y < 2⁵²` miss,
+   which the edge cases trigger on purpose.
+4. **Ground truth** — every candidate of a small grid is recomputed
+   independently (full fixed-base scalar multiplication, projective, packed by
+   donna), and the set whose key has a given hex digit must be exactly what the
+   kernel records, for a cold launch and for the next one off the carried
+   state. This is the test that pins the addition formula itself: the other
+   kernel tests compare the kernel with itself, which a formula that was
+   consistently wrong would pass.
+5. **Prefix list** — searching a list of mixed-length prefixes finds exactly
    the union of what the single-prefix kernel finds for each entry on its own:
    nothing missed, nothing invented. The lengths are deliberately mixed, so a
    filter that ignored the per-entry mask would fail.
-5. **Persistent walk** — the search kernel is run with every thread's base
+6. **Persistent walk** — the search kernel is run with every thread's base
    moved on by one window from a cold seed, and separately at the original bases
    and then once more off the state it carried over;
    with a real prefix the recorded hits depend on the actual points, so the two
    must agree exactly. Nothing else would catch a drifting walk: the recorded
    units stay in range whether or not the points are right.
-6. **Window coverage** — the real search kernel is run with an empty prefix, so
+7. **Window coverage** — the real search kernel is run with an empty prefix, so
    every candidate reports itself and the recorded set is the exact set of
    scalars the window walked. It must be precisely `[0, threads·W)`: no gap, no
    duplicate, no overrun into the neighbouring thread's span. This is what
    guards the ±i walk, whose failure mode is silently losing or repeating
    candidates rather than producing wrong keys. Checked for a power-of-two
    window, a "half" window, and more than one thread.
-7. **Repeat rules** — `--repeat-nibble` alone, and both repeat rules together
+8. **Repeat rules** — `--repeat-nibble` alone, and both repeat rules together
    with a prefix list, must record exactly what the equivalent explicit prefix
    list records (16 and 274 entries). The nibble rule uses an odd length, where
    the digits are not a contiguous run of bits.
-8. **Hit probability** — for several mixes of nested, overlapping and redundant
+9. **Hit probability** — for several mixes of nested, overlapping and redundant
    prefixes and rules, every 5-digit key is enumerated; the matching fraction
    must equal the computed estimate exactly, and dropping redundant criteria
    must not change which keys match.

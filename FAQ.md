@@ -20,7 +20,8 @@ binary covering sm_60…sm_90 plus a PTX fallback, so it runs on other generatio
 too. Build from source with `make ARCH=sm_XX` for your specific card.
 
 ### How fast is it?
-Hundreds of Mkeys/s on a modern NVIDIA GPU — orders of magnitude faster than a
+About a billion keys per second on a modern NVIDIA GPU (~1.05 Gkeys/s on a
+35 W RTX 3050 Laptop) — orders of magnitude faster than a
 naive per-candidate search. Exact throughput depends on your GPU and the
 `--window` setting; measure it by running a search and reading the `Mkeys/s`
 counter after a few seconds of warm-up (a cold start — context init, JIT, boost
@@ -28,8 +29,8 @@ ramp — roughly halves the first few seconds).
 
 ### How long will my prefix take?
 Each hex nibble is 4 bits, so an N-nibble prefix needs ~2^(4N) attempts on
-average. As a rough guide at ~700 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
-~6 s, 10 nibbles ≈ ~25 min, 12 nibbles ≈ ~4.5 days. The tool prints
+average. As a rough guide at ~1 Gkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
+~4 s, 10 nibbles ≈ ~18 min, 12 nibbles ≈ ~3 days. The tool prints
 `Estimated attempts: 2^bits` at startup.
 
 Those are averages, not deadlines — the search is memoryless, so being twice
@@ -118,7 +119,7 @@ windows actually fit your GPU (unfitting ones show `OOM/skip`).
 ### Which `--window` (and `--tpb`) should I use?
 Mostly you should leave `--window` alone. Since a thread now carries its walk
 across launches, throughput barely depends on the window: past ~1024 the only
-thing left to amortise is one field inversion per window, worth under 1.3% in
+thing left to amortise is one field inversion per window, worth about 2% in
 total, while the memory reserve keeps growing with `W`. The default caps at 2048
 for that reason. If you do want the last percent, run `--benchmark`: it times
 every window that fits (~1s each) with the memory reserve, then sweeps the block
