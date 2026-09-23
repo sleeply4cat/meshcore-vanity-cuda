@@ -873,6 +873,39 @@ static size_t window_reserve_bytes(int window, int numSM, int maxThreadsSM) {
     return (size_t)numSM * maxThreadsSM * window_local_bytes(window);
 }
 
+// Grid size. Every thread's work is identical, so blocks finish in lockstep
+// "waves" of (SM count x blocks resident per SM), and a grid that is not a
+// whole number of waves leaves most SMs idle during the last one: 512 blocks on
+// a 170-SM GPU is 3.01 waves, i.e. four waves of time for three of work. So the
+// default grid is always whole waves. Many of them, too: with several blocks per
+// SM, blocks drift out of phase over the waves, so the serial stretches of a
+// window (the inversion) overlap other blocks' multiply-heavy loops instead of
+// all SMs' warps stalling on them at once — worth ~14% on an RTX 5060 Ti from 5
+// to 40 waves, while one block per SM (tpb 384) stays flat. Registers, not
+// shared memory, bound residency (168 per thread: 12 warps per SM), so blocks
+// per SM comes from the occupancy calculator for the actual kernel.
+#define DEFAULT_WAVES 32
+#define STR_(x) #x
+#define STR(x) STR_(x)
+#define DEFAULT_TPB 128
+
+static int blocks_per_sm(int window, int tpb) {
+    int bps = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, vanity_kernel_ptr(window), tpb, 0)
+            != cudaSuccess || bps < 1) {
+        cudaGetLastError();
+        bps = 1;             // not resident at all: the launch itself will say so
+    }
+    return bps;
+}
+
+static int wave_blocks(int window, int tpb, int waves) {
+    int dev = 0, numSM = 1;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, dev);
+    return numSM * blocks_per_sm(window, tpb) * waves;
+}
+
 // Largest supported window whose local-memory reserve fits free VRAM with a
 // margin, but not larger than AUTO_WINDOW_CAP.
 //
@@ -907,13 +940,14 @@ static int nearest_window(int req) {
 }
 
 static int run_selftest();
-static int run_benchmark(int blocks, int tpb);
+static int run_benchmark();
 
 int main(int argc, char **argv) {
     Criteria crit;
     long limit = 1;
-    int blocks = 512;
-    int tpb = 256;
+    int blocks = 0;              // 0 = whole waves (DEFAULT_WAVES)
+    int tpb = DEFAULT_TPB;
+    bool grid_given = false;
     int device = 0;
     int window = 0;              // 0 = auto-fit to VRAM
     bool progress = true;
@@ -934,8 +968,9 @@ int main(int argc, char **argv) {
         if (a == "--selftest") selftest = true;
         else if (a == "--benchmark" || a == "--bench") benchmark = true;
         else if (a == "-l" || a == "--limit") limit = parse_num(need("--limit"), "--limit");
-        else if (a == "--blocks") blocks = (int)parse_num(need("--blocks"), "--blocks");
-        else if (a == "--tpb") tpb = (int)parse_num(need("--tpb"), "--tpb");
+        else if (a == "--blocks") { blocks = (int)parse_num(need("--blocks"), "--blocks"); grid_given = true;
+                                    if (blocks < 1) { fprintf(stderr, "--blocks must be at least 1.\n"); return 1; } }
+        else if (a == "--tpb") { tpb = (int)parse_num(need("--tpb"), "--tpb"); grid_given = true; }
         else if (a == "-d" || a == "--device") device = (int)parse_num(need("--device"), "--device");
         else if (a == "-w" || a == "--window") window = (int)parse_num(need("--window"), "--window");
         else if (a == "--repeat-nibble") {
@@ -959,8 +994,8 @@ int main(int argc, char **argv) {
                    "  -l, --limit N     stop after N matches total (0 = infinite) [1]\n"
                    "  -w, --window N    batch/thr: 64..16384 incl. 1536/3072/6144/12288 [auto VRAM]\n"
                    "                    past ~2048 at most ~2%% faster, but much more GPU memory\n"
-                   "      --blocks N    CUDA blocks [512]\n"
-                   "      --tpb N       threads per block, 32..384 [256]\n"
+                   "      --blocks N    CUDA blocks [auto: 32 whole waves for this GPU]\n"
+                   "      --tpb N       threads per block, 32..384 [128]\n"
                    "  -d, --device I    CUDA device index [0]\n"
                    "      --no-progress suppress progress output\n"
                    "      --selftest    run correctness self-tests and exit\n"
@@ -981,7 +1016,6 @@ int main(int argc, char **argv) {
         tpb = VANITY_MAX_TPB;
     }
     if (tpb < 32) { fprintf(stderr, "Block size must be at least 32.\n"); return 1; }
-    if (blocks < 1) { fprintf(stderr, "--blocks must be at least 1.\n"); return 1; }
 
     cuda_check(cudaSetDevice(device), "setDevice");
     // Block (sleep) the host thread while waiting on the GPU instead of the
@@ -990,7 +1024,11 @@ int main(int argc, char **argv) {
     cuda_check(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), "setDeviceFlags");
 
     if (selftest) return run_selftest();
-    if (benchmark) return run_benchmark(blocks, tpb);
+    if (benchmark) {
+        if (grid_given || window)
+            fprintf(stderr, "Note: --benchmark sweeps --window, --tpb and --blocks itself.\n");
+        return run_benchmark();
+    }
 
     if (crit.prefixes.empty() && crit.rules.empty()) {
         fprintf(stderr, "Give a hex prefix or a --repeat-* rule. Use --help.\n");
@@ -1030,6 +1068,9 @@ int main(int argc, char **argv) {
         window = snap;
     }
 
+    const bool auto_blocks = blocks == 0;
+    if (auto_blocks) blocks = wave_blocks(window, tpb, DEFAULT_WAVES);
+
     const double p_hit = hit_probability(crit);    // per-candidate chance of any match
     const unsigned long long threads = (unsigned long long)blocks * tpb;
     unsigned long long per_launch = threads * (unsigned long long)window;
@@ -1050,8 +1091,8 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr, "Estimated attempts: 2^%.1f\n", -log2(p_hit));
-    fprintf(stderr, "Grid: %d blocks x %d threads, window %d => %llu candidates/launch\n",
-            blocks, tpb, window, per_launch);
+    fprintf(stderr, "Grid: %d blocks%s x %d threads, window %d => %llu candidates/launch\n",
+            blocks, auto_blocks ? " (" STR(DEFAULT_WAVES) " whole waves)" : "", tpb, window, per_launch);
 
     // Device buffers.
     uint8_t *d_scalar, *d_pub;
@@ -1730,7 +1771,7 @@ static int run_selftest() {
 }
 
 // -------------------------------------------------------------------------
-// One benchmark point: fresh context, build the step table, ~1s warm-up + ~1s
+// One benchmark point: fresh context, build the step table, ~1s warm-up + ~1.5s
 // timed measurement for a (window, blocks, tpb) config. Returns Mkeys/s, or -1
 // if it does not fit / cannot launch (OOM, or the register-per-block limit at
 // large tpb). Each point uses a fresh context so its numbers match a real
@@ -1769,75 +1810,90 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
     unsigned long long tmp = 0;
     if (run_span(1.0, tmp) < 0) return -1;         // warm-up doubles as a fit check
     unsigned long long cand = 0;
-    double el = run_span(1.0, cand);
+    double el = run_span(1.5, cand);
     return (el > 0) ? (double)cand / el / 1e6 : 0;
 }
 
 // -------------------------------------------------------------------------
-// Quick benchmark: sweep every window at the base block size, then sweep the
-// block size (tpb) over the two fastest windows, and report the best
-// (window, tpb). ~1s warm-up + ~1s measured per point.
+// Benchmark: find the fastest (window, tpb, blocks) for this GPU in three
+// sweeps, each around the best of the previous one (~1 minute in total):
+//   1. every window, at the default tpb and grid;
+//   2. tpb over the two fastest windows (two, because the ranking of windows is
+//      not separable from tpb);
+//   3. the number of whole waves for the best pair.
+// Grids are always whole waves (see wave_blocks); an explicit --blocks that is
+// not a multiple of SM count x blocks per SM wastes part of the last wave.
 // -------------------------------------------------------------------------
-static int run_benchmark(int blocks, int tpb) {
+static int run_benchmark() {
     int numSM = 1, maxThreadsSM = 1, dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, dev);
     cudaDeviceGetAttribute(&maxThreadsSM, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, dev);
+    fprintf(stderr, "Benchmarking %s (%d SM), ~1 minute...\n", prop.name, numSM);
 
-    // Phase 1 — window sweep at the base block size; keep the top two fitting
-    // windows for the grid sweep.
-    fprintf(stderr, "Benchmarking on %d SM (blocks %d, tpb %d)...\n", numSM, blocks, tpb);
-    printf("%6s  %10s  %8s  %9s\n", "window", "Mkeys/s", "loc/thr", "reserve");
-    double best_mps = 0, second_mps = 0; int best_w = 0, second_w = 0;
+    struct Pt { int w, tpb, waves, blocks; double mps; };
+    Pt best{0, 0, 0, 0, -1};
+    auto measure = [&](int w, int t, int waves) {
+        Pt p{w, t, waves, wave_blocks(w, t, waves), 0};
+        p.mps = bench_one(w, p.blocks, t, dev);
+        if (p.mps > best.mps) best = p;
+        return p;
+    };
+
+    // 1. Windows.
+    printf("%6s  %10s  %8s  %9s   (tpb %d, %d waves)\n", "window", "Mkeys/s", "loc/thr",
+           "reserve", DEFAULT_TPB, DEFAULT_WAVES);
+    double w1 = -1, w2 = -1; int win1 = 0, win2 = 0;
     const int nW = (int)(sizeof(kWindows) / sizeof(kWindows[0]));
     for (int idx = nW - 1; idx >= 0; idx--) {      // ascending, small windows first
-        int w = kWindows[idx];
-        double mps = bench_one(w, blocks, tpb, dev);
+        const int w = kWindows[idx];
+        Pt p = measure(w, DEFAULT_TPB, DEFAULT_WAVES);
         size_t localB = window_local_bytes(w);     // context is alive after bench_one
         size_t reserveMB = window_reserve_bytes(w, numSM, maxThreadsSM) >> 20;
-        if (mps < 0)
+        if (p.mps < 0)
             printf("%6d  %10s  %6zuKB  %6zuMB\n", w, "OOM/skip", localB >> 10, reserveMB);
         else {
-            printf("%6d  %10.1f  %6zuKB  %6zuMB\n", w, mps, localB >> 10, reserveMB);
-            if (mps > best_mps) { second_mps = best_mps; second_w = best_w; best_mps = mps; best_w = w; }
-            else if (mps > second_mps) { second_mps = mps; second_w = w; }
+            printf("%6d  %10.1f  %6zuKB  %6zuMB\n", w, p.mps, localB >> 10, reserveMB);
+            if (p.mps > w1) { w2 = w1; win2 = win1; w1 = p.mps; win1 = w; }
+            else if (p.mps > w2) { w2 = p.mps; win2 = w; }
         }
         fflush(stdout);
     }
+    if (!win1) { printf("No window fits this GPU.\n"); return 1; }
 
-    // Phase 2 — grid sweep over the top two windows x block size. Two windows,
-    // not one, because the per-block register limit can bar a large tpb on the
-    // biggest window while a slightly smaller one still allows it (the window
-    // ranking is not separable from tpb). Blocks are held fixed: beyond a few
-    // waves they barely matter.
-    int gw = best_w, gtpb = tpb; double gmps = best_mps;
-    if (best_w) {
-        const int cand[2] = {best_w, second_w};
-        const int ncand = second_w ? 2 : 1;
-        printf("\nGrid sweep (top windows x block size):\n%8s  %6s  %10s\n",
-               "window", "tpb", "Mkeys/s");
-        for (int c = 0; c < ncand; c++) {
-            // VANITY_MAX_TPB is the ceiling (see __launch_bounds__); anything
-            // above it cannot launch, so there is nothing to measure. Within
-            // that range the block size is not monotone — resident threads per
-            // SM move in steps, so 128 and 384 can both beat 256.
-            for (int t : {128, 256, VANITY_MAX_TPB}) {
-                double mps = bench_one(cand[c], blocks, t, dev);
-                if (mps < 0) printf("%8d  %6d  %10s\n", cand[c], t, "skip");
-                else {
-                    printf("%8d  %6d  %10.1f\n", cand[c], t, mps);
-                    if (mps > gmps) { gmps = mps; gw = cand[c]; gtpb = t; }
-                }
-                fflush(stdout);
-            }
+    // 2. Block size over the two fastest windows. VANITY_MAX_TPB is the ceiling
+    // (see __launch_bounds__); within the range the best is not monotone.
+    printf("\n%8s  %6s  %7s  %10s   (%d waves)\n", "window", "tpb", "blocks", "Mkeys/s", DEFAULT_WAVES);
+    for (int w : {win1, win2}) {
+        if (!w) continue;
+        for (int t : {64, DEFAULT_TPB, 256, VANITY_MAX_TPB}) {
+            Pt p = t == DEFAULT_TPB ? Pt{w, t, DEFAULT_WAVES, wave_blocks(w, t, DEFAULT_WAVES),
+                                         w == win1 ? w1 : w2}
+                                    : measure(w, t, DEFAULT_WAVES);
+            if (p.mps < 0) printf("%8d  %6d  %7d  %10s\n", w, t, p.blocks, "skip");
+            else printf("%8d  %6d  %7d  %10.1f\n", w, t, p.blocks, p.mps);
+            fflush(stdout);
         }
+    }
+
+    // 3. Number of waves for the best pair.
+    const Pt pair = best;
+    printf("\n%8s  %6s  %6s  %7s  %10s\n", "window", "tpb", "waves", "blocks", "Mkeys/s");
+    for (int waves : {8, 16, DEFAULT_WAVES, 64}) {
+        Pt p = waves == pair.waves ? pair : measure(pair.w, pair.tpb, waves);
+        if (p.mps < 0) printf("%8d  %6d  %6d  %7d  %10s\n", p.w, p.tpb, waves, p.blocks, "skip");
+        else printf("%8d  %6d  %6d  %7d  %10.1f\n", p.w, p.tpb, waves, p.blocks, p.mps);
+        fflush(stdout);
     }
 
     cudaDeviceReset();
     cudaSetDevice(dev);
-    printf("(reserve = worst-case local memory the driver pins = "
+    printf("\n(reserve = worst-case local memory the driver pins = "
            "SM count x maxThreadsPerSM x loc/thr)\n");
-    if (best_w)
-        printf("Fastest: --window %d --tpb %d  (%.1f Mkeys/s)\n", gw, gtpb, gmps);
+    printf("Fastest: --window %d --tpb %d --blocks %d  (%.1f Mkeys/s)\n",
+           best.w, best.tpb, best.blocks, best.mps);
+    printf("Differences under ~1%% are within run-to-run noise.\n");
     return 0;
 }

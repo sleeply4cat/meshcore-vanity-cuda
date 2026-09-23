@@ -26,10 +26,11 @@ faster (see [How it works](#how-it-works)).
 ```bash
 make                      # build for your GPU (default sm_86)
 make ARCH=sm_75           # build for a specific architecture
-make release              # portable fat binary (sm_60…sm_90 + PTX fallback)
+make release              # portable fat binary (sm_60…sm_120 + PTX fallback)
 ```
 
-Requires the CUDA toolkit (tested with 12.0+) and an NVIDIA GPU. The batch
+Requires the CUDA toolkit (tested with 12.0+; `make release` needs 12.8+ for
+RTX 50 / sm_120) and an NVIDIA GPU. The batch
 window is a **runtime** option (see below), so one binary runs on any GPU — no
 per-machine rebuild. `make release` produces a single binary that runs across
 GPU generations.
@@ -45,38 +46,51 @@ GPU generations.
   -l, --limit N     stop after N matches total (0 = infinite) [1]
   -w, --window N    batch/thread: 64…16384 (see below) [auto-fit VRAM]
                     past ~2048 at most ~2% faster, but much more GPU memory
-      --blocks N    CUDA blocks [512]
-      --tpb N       threads per block, 32…384 [256]
+      --blocks N    CUDA blocks [auto: 32 whole waves for this GPU]
+      --tpb N       threads per block, 32…384 [128]
   -d, --device I    CUDA device index [0]
       --no-progress suppress progress output
       --selftest    run correctness self-tests and exit
-      --benchmark   sweep window + block size, print the fastest, and exit
+      --benchmark   sweep window, block size and grid, print the fastest, exit
 ```
 
-Run `--benchmark` first: it sweeps every window that fits your GPU, then sweeps
-the block size over the top two windows, and prints the config to use:
+The defaults are tuned to be close to the best on any GPU (`--tpb 128`, a grid
+of 32 whole waves, the largest window ≤ 2048 that fits). To find the exact best
+for yours, run `--benchmark`. It takes about a minute: it times every window
+that fits, then the block size over the two fastest windows, then the number of
+waves for the best pair, and prints the options to use:
 
 ```
 $ ./meshcore-vanity --benchmark
-window     Mkeys/s   loc/thr    reserve
-   512        621.9     10KB     246MB
-  1024        633.7     20KB     486MB
-  2048        635.3     40KB     966MB
-  6144        643.5    120KB    2887MB
-  8192     OOM/skip    160KB    3846MB
-...
-Grid sweep (top windows x block size):
-  window     tpb     Mkeys/s
-    6144     128       661.4
-    6144     256       644.1
-    6144     384       682.3
-Fastest: --window 6144 --tpb 384  (682.3 Mkeys/s)
+Benchmarking NVIDIA GeForce RTX 3050 Laptop GPU (16 SM), ~1 minute...
+window     Mkeys/s   loc/thr    reserve   (tpb 128, 32 waves)
+    64       696.7       1KB      37MB
+  ...
+  2048      1103.8      40KB     967MB
+  3072      1112.9      60KB    1447MB
+  4096      1111.0      80KB    1927MB
+  6144      1112.4     120KB    2887MB
+  8192    OOM/skip     160KB    3847MB
+  ...
+  window     tpb   blocks     Mkeys/s   (32 waves)
+    3072      64     3072      1103.7
+    3072     128     1536      1112.9
+    3072     256      512      1026.4
+    3072     384      512      1090.4
+  ...
+  window     tpb   waves   blocks     Mkeys/s
+    3072     128       8      384      1099.9
+    3072     128      16      768      1102.5
+    3072     128      32     1536      1112.9
+    3072     128      64     3072      1100.5
+
+Fastest: --window 3072 --tpb 128 --blocks 1536  (1112.9 Mkeys/s)
+Differences under ~1% are within run-to-run noise.
 ```
 
-(The top two windows are swept because the per-block register limit can bar a
-large `tpb` on the biggest window while a slightly smaller one still allows it.
-The block size is not monotone either: resident threads per SM move in steps, so
-128 and 384 can both beat 256.)
+Here the defaults already run at 1104 Mkeys/s, within 1% of the best. Why the
+block size and the grid matter at all is explained under
+[Block size and grid](#block-size-and-grid---tpb---blocks).
 
 Output is a 64-hex public key and a 128-hex private key (32-byte scalar +
 32-byte random signing component), matching the MeshCore format.
@@ -400,15 +414,32 @@ though their *live* occupancy is low.
   2048**, since anything beyond that trades a bounded ~2% for several times the
   memory; on out-of-memory it auto-falls back to a smaller one.
 
-If you want the last percent, use **`--benchmark`**: it measures `Mkeys/s` and
-the memory reserve for every window (unfitting ones show `OOM/skip`), then sweeps
-the block size over the top two windows and prints the `--window`/`--tpb` to use.
-Do sweep `--tpb`
-too: resident-warps-per-SM granularity makes the best block size non-obvious —
-128 and 384 can both beat 256. 384 is the ceiling: a block may use 65536
-registers, allocated per warp in units of 256, and the kernel is pinned by
-`__launch_bounds__` to the 168 registers per thread that let a 12-warp block
-fit. Larger `--tpb` is clamped with a message.
+If you want the last percent, use **`--benchmark`** (see *Usage*).
+
+### Block size and grid (`--tpb`, `--blocks`)
+
+The kernel is pinned by `__launch_bounds__` to 168 registers per thread, so an
+SM holds 12 warps: a block may use 65536 registers, allocated per warp in units
+of 256. That makes the block size matter in steps. `--tpb 256` is the bad one —
+two 8-warp blocks do not fit, so an SM runs a single block, 8 warps out of 12 —
+and it was the old default (−7% on an RTX 3050, −10% on an RTX 5060 Ti). 384 is
+the ceiling (one 12-warp block); larger values are clamped with a message.
+
+Every thread does identical work, so blocks finish in lockstep **waves** of
+`SM count × blocks per SM`, and a grid that is not a whole number of waves
+leaves most SMs idle during the last one. The old fixed 512 blocks was 3.01
+waves on a 170-SM RTX 5090 — four waves of time for three of work — and cost
+~5% on an RTX 5060 Ti (36 SM). The grid is now sized with the occupancy
+calculator to **32 whole waves** on any GPU.
+
+Many waves matter as well. With several small blocks per SM (the default
+`--tpb 128`: three), blocks drift out of phase over the waves, so one block's
+serial stretch — the inversion, a long chain of squarings — overlaps other
+blocks' multiply-heavy loops instead of every warp on the SM stalling on it at
+once. On an RTX 5060 Ti, going from 5 to 40 waves at `--tpb 128` is worth
+**~14%**; with one 384-thread block per SM, which cannot drift, the number of
+waves makes no difference and it tops out ~12% lower. Together, the new
+defaults run the RTX 5060 Ti at ~5.9 Gkeys/s instead of 4.46.
 
 ## Correctness
 

@@ -15,9 +15,12 @@ being printed, and the math is cross-validated against libsodium/PyNaCl (see
 
 ### Do I need a GPU? Which one?
 Yes — it's GPU-only, there is no CPU search path. Any NVIDIA GPU with a recent
-driver works. It's tuned for Ampere (sm_86), but the released binary is a fat
-binary covering sm_60…sm_90 plus a PTX fallback, so it runs on other generations
-too. Build from source with `make ARCH=sm_XX` for your specific card.
+driver works. The released binary is a fat binary with native code for
+sm_60…sm_90 and sm_120 (RTX 50) plus PTX fallbacks, so it runs on other
+generations too. A GPU without native code in it gets the PTX compiled by the
+driver on the first run, which takes a few minutes for this program (3m15s on
+an RTX 5060 Ti from the sm_90 PTX) and is cached afterwards. Build from source
+with `make ARCH=sm_XX` for your specific card.
 
 ### How fast is it?
 About a billion keys per second on a modern NVIDIA GPU (~1.05 Gkeys/s on a
@@ -112,8 +115,8 @@ Large windows reserve a lot of GPU memory — the driver pins per-thread local
 memory for the SM's full thread capacity (`SM_count × maxThreadsPerSM × W·20`
 bytes), which for big `W` can be several GB. The default caps itself at `W=2048`
 (~1 GB on a 16-SM GPU) and falls back further on OOM, so you should only see this
-after asking for a big `--window` explicitly. If it still fails, lower `--blocks`
-or set a smaller `--window` (e.g. `128` or `64`). Run `--benchmark` to see which
+after asking for a big `--window` explicitly. If it still fails, set a smaller
+`--window` (e.g. `128` or `64`) or fewer `--blocks`. Run `--benchmark` to see which
 windows actually fit your GPU (unfitting ones show `OOM/skip`).
 
 ### Which `--window` (and `--tpb`) should I use?
@@ -122,11 +125,16 @@ across launches, throughput barely depends on the window: past ~1024 the only
 thing left to amortise is one field inversion per window, worth about 2% in
 total, while the memory reserve keeps growing with `W`. The default caps at 2048
 for that reason. If you do want the last percent, run `--benchmark`: it times
-every window that fits (~1s each) with the memory reserve, then sweeps the block
-size over the top two windows and prints the exact `--window`/`--tpb` to use.
-Don't skip the `--tpb` part: 128 or 384 usually beat the 256 default. 384 is the hard ceiling (the kernel is pinned
-to 168 registers per thread so a 12-warp block still fits the 64K-registers-
-per-block budget); anything larger is clamped with a message.
+every window that fits (~2.5 s each) with the memory reserve, then sweeps the block
+size over the top two windows, then the number of waves for the best pair, and
+prints the exact `--window`/`--tpb`/`--blocks` to use (about a minute).
+
+The defaults (`--tpb 128`, 32 whole waves of blocks) are what the benchmark
+picks on the GPUs tested so far, so most runs need no options at all. Avoid
+`--tpb 256` (one 8-warp block per SM leaves a third of the SM's warp slots
+empty), and if you set `--blocks` by hand, make it a multiple of
+`SM count × blocks per SM` (the `Grid:` line shows the default count) — see
+[README → Block size and grid](README.md#block-size-and-grid---tpb---blocks).
 
 ### Is it safe? Is my private key exposed?
 The private key is generated locally on your machine and only printed to stdout —
