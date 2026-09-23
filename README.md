@@ -14,7 +14,9 @@ faster (see [How it works](#how-it-works)).
 ## MeshCore key format
 
 - **Private key** = 64 bytes: `[0..31]` a pre-clamped Ed25519 scalar, `[32..63]`
-  an independent random signing component (does **not** affect the public key).
+  an independent random signing component. It does **not** affect the public
+  key, but it keys the nonce of every signature, so it is exactly as secret as
+  the scalar: whoever knows it can recover the scalar from one signature.
 - **Public key** = `clamp(scalar) · B`, compressed to 32 bytes. No Blake2b, no
   base32 — the prefix is matched directly against the raw public-key bytes.
 - clamp: `s[0] &= 0xF8; s[31] &= 0x7F; s[31] |= 0x40`.
@@ -35,10 +37,14 @@ GPU generations.
 ## Usage
 
 ```
-./meshcore-vanity <HEX_PREFIX> [options]
-  -l, --limit N     stop after N matches (0 = infinite) [1]
+./meshcore-vanity [HEX_PREFIX ...] [options]
+  A key counts when it meets ANY of the criteria; all are searched in one pass.
+  HEX_PREFIX            key starts with these hex digits (several allowed)
+      --repeat-nibble N key starts with N+ identical hex digits (AAAA…)
+      --repeat-byte N   key starts with N+ identical bytes (ABABAB…)
+  -l, --limit N     stop after N matches total (0 = infinite) [1]
   -w, --window N    batch/thread: 64…16384 (see below) [auto-fit VRAM]
-                    bigger can be faster but reserves much more GPU memory
+                    past ~2048 at most ~1.3% faster, but much more GPU memory
       --blocks N    CUDA blocks [512]
       --tpb N       threads per block, 32…384 [256]
   -d, --device I    CUDA device index [0]
@@ -83,12 +89,71 @@ Private Key: E8F0193C0793...FCAB3C31
 ```
 
 Each hex nibble is 4 bits, so an N-nibble prefix takes ~2^(4N) attempts on
-average; the tool prints `Estimated attempts` at startup. One prefix per run —
-launch separate instances for separate prefixes.
+average; the tool prints `Estimated attempts` at startup.
+
+Several prefixes can be searched in one pass — a hit on any of them counts, so
+the expected time divides by their number:
+
+```
+$ ./meshcore-vanity beef cafe f00d --limit 1
+Searching for keys that match:
+  prefix BEEF             req BEEF mask FFFF
+  prefix CAFE             req CAFE mask FFFF
+  prefix F00D             req F00D mask FFFF
+Estimated attempts: 2^14.4
+...
+Found matching key!
+Prefix:      CAFE
+Public Key:  CAFE7C1D...
+```
+
+Redundant entries are dropped with a note — `cafe` next to `ca` adds nothing,
+since every key starting with `CAFE` already starts with `CA`.
+
+This beats running one instance per prefix, which would split the GPU between
+them and test one prefix each at a fraction of the throughput. A list tests every
+entry against the *same* arithmetic, so it costs only the extra comparisons —
+about 1.5% of throughput per entry (3.5% for two, 14% for eight), against an
+N-fold reduction in expected time. A single prefix runs a separate kernel and
+pays nothing at all for the feature.
+
+### Any "pretty" key: repeat rules
+
+If you don't care *which* digit, only that the key starts with a run of one:
+
+```
+$ ./meshcore-vanity --repeat-nibble 7 --repeat-byte 4 --limit 3
+Searching for keys that match:
+  7+ identical hex digits (0000000, AAAAAAA, ...)
+  4+ identical bytes (ABABABAB, ...)
+Estimated attempts: 2^23.0
+...
+Found matching key!
+Repeat:      4 identical bytes
+Public Key:  03030303F392166F...
+Found matching key!
+Repeat:      8 identical hex digits
+Public Key:  EEEEEEEE3BAB2146...
+```
+
+- `--repeat-nibble N`: the first N hex digits are all the same (`AAAAAAA…`).
+  Any of 16 digits will do, so it costs as much as a specific prefix one digit
+  shorter.
+- `--repeat-byte N`: the first N bytes are all the same (`ABABAB…`, and also
+  `AAAAAA…`, since `AA` is a byte too). Any of 256 bytes will do, so it costs
+  as much as a specific prefix one *byte* shorter.
+
+The printed `Repeat:` line gives the run the key actually has, which can be
+longer than asked. Both rules combine with each other and with prefixes, and a
+key meeting any of them counts; the estimate accounts for the overlaps exactly
+(e.g. `EEEEEEEE` meets both rules above, and is counted once). The check itself
+is a masked compare against the first digit or byte broadcast across the word,
+as cheap as the single-prefix one, and each combination of criteria is its own
+kernel, so a search never pays for a check it does not use.
 
 While looking for the first key, the progress line also reports how likely it is
-that a match was already inside the span searched so far —
-`1 − (1 − 2^-bits)^attempts`:
+that a match was already inside the span searched so far — `1 − (1 − p)^attempts`,
+where `p` is the per-candidate chance of meeting any of the criteria:
 
 ```
 Tried 3892314112 keys (282.9 Mkeys/s), 59.6% chance it was already in range
@@ -99,11 +164,11 @@ this number tells you where you actually are on the curve. Passing 50% is
 expected roughly at the average; sitting at 95% without a hit is unlucky but not
 evidence anything is wrong.
 
-> The in-kernel filter matches the low 255 bits of the public key (the `y`
-> coordinate). Bit 255 (the `x` parity) is not used for filtering, so the
-> effective maximum prefix is 63 hex nibbles — irrelevant in practice. The
-> displayed public key is always the full, correct compressed key (recomputed
-> and re-verified on a hit).
+> The in-kernel filter only looks at the first 8 bytes of the key (the low
+> bits of `y`); every candidate that passes it is recomputed on the host as the
+> full, correct compressed key — `x` parity bit included — and checked against
+> the whole criterion, so prefixes and repeat runs can be up to 64 hex digits
+> long. Anything past 16 digits is far out of reach anyway.
 
 More operational questions (old distros, CUDA errors, out-of-memory, timing)
 are answered in [FAQ.md](FAQ.md).
@@ -212,8 +277,9 @@ fall back to plain C.
 Setting up a window used to cost a full fixed-base scalar multiplication for the
 thread's centre point plus an inversion to make it affine — about 600 field
 multiplies per thread per launch, paid again every launch. Instead the thread
-**keeps its centre** and advances it by `D = (threads·W·8)·B`, the exact span the
-host adds to its `base` counter, so the two stay in lockstep.
+**keeps its centre** and advances it by one window, `D = (W·8)·B`, while the host
+counts the thread's launches since its base was drawn, so the two stay in
+lockstep.
 
 Advancing in affine coordinates needs the two addition denominators `1 ± C`
 (`C = K·xD·yD`), which would normally mean another inversion. Instead the
@@ -248,16 +314,28 @@ pass), which is what makes the affine walk cheap. Thanks to the ±i pairing the
 batch has only `W/2` slots for `W` candidates. This is the standard
 high-throughput layout used by GPU key searchers.
 
-### No repeated work across launches
+### Randomness, independent keys, no repeated work
 
-Thread `g` owns candidates `s = base + (g·W + j)·8`, `j ∈ [0,W)` — disjoint by
-construction within a launch. (It walks that span outwards from the middle, but
-the span itself is unchanged; the `+i` half stops one short of the neighbour's
-first unit.) Between launches the host advances the `base` counter by exactly
-the span it just covered (`base += T·W·8`, `T` = total threads), so launches
-cover contiguous, non-overlapping intervals. The base starts from a fresh random
-value each run; there is no re-rolling and thus no chance of recomputing the
-same batch.
+Every thread `g` has **its own random base** `base_g`, drawn from the OS CSPRNG
+(`getrandom` / `BCryptGenRandom`) and clamped. In its `k`-th launch on that base
+it owns candidates `s = base_g + (k·W + j)·8`, `j ∈ [0,W)`: consecutive launches
+continue the same contiguous run, and the `+i` half of the ±i walk stops one
+short of the next window's first unit, so nothing is visited twice. Runs of
+different threads start 2²⁵⁰-ish apart at random, so they never meet in
+practice.
+
+The per-thread base matters for the keys, not for speed. A private key is its
+base plus a known small offset, so two keys found on **one** base would differ
+by a small, easily brute-forced multiple of 8 — leaking one would give away the
+other. So a thread yields **at most one key per base**: when it produces a hit,
+the host checks and prints it, gives that thread a fresh random base (re-seeded
+with one fixed-base multiply on its next launch), and ignores its other hits
+from the same window. Keys from different bases are independent, so `--limit N`
+gives N unrelated keys. Only very loose criteria, which one thread meets several
+times in one window, lose anything to this.
+
+Randomness is drawn only when a base is drawn and for each printed key's signing
+half — never on the GPU path — so this costs no throughput.
 
 ### The batch window (`--window`)
 
@@ -306,8 +384,9 @@ fit. Larger `--tpb` is clamped with a message.
 1. **Incremental identity** — `(s+8)·B == s·B + 8·B` for 512 random scalars
    (validates `scalarmult` + niels addition, which the step-table precompute
    uses).
-2. **Known-answer** — prints `scalar·B` for a fixed scalar; it matches
-   `crypto_scalarmult_ed25519_base_noclamp` from PyNaCl / libsodium:
+2. **Known-answer** — `scalar·B` for a fixed scalar must equal
+   `crypto_scalarmult_ed25519_base_noclamp` from PyNaCl / libsodium (the
+   expected value is built in; a mismatch fails the run):
 
    ```
    scalar 0002030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F60
@@ -317,22 +396,35 @@ fit. Larger `--tpb` is clamped with a message.
 3. **Fast filter vs. reference packing** — the low-64-bit fast path must agree
    with donna's full 32-byte `contract` on 4096 random field elements plus the
    canonicalisation edge cases (`0`, `1`, `p−1`, `p`, `p+1`, `2²⁵⁵−1`).
-4. **Persistent walk** — the search kernel is run at `base2` from a cold seed,
-   and separately at `base` and then at `base2` off the state it carried over;
+4. **Prefix list** — searching a list of mixed-length prefixes finds exactly
+   the union of what the single-prefix kernel finds for each entry on its own:
+   nothing missed, nothing invented. The lengths are deliberately mixed, so a
+   filter that ignored the per-entry mask would fail.
+5. **Persistent walk** — the search kernel is run with every thread's base
+   moved on by one window from a cold seed, and separately at the original bases
+   and then once more off the state it carried over;
    with a real prefix the recorded hits depend on the actual points, so the two
    must agree exactly. Nothing else would catch a drifting walk: the recorded
    units stay in range whether or not the points are right.
-5. **Window coverage** — the real search kernel is run with an empty prefix, so
+6. **Window coverage** — the real search kernel is run with an empty prefix, so
    every candidate reports itself and the recorded set is the exact set of
    scalars the window walked. It must be precisely `[0, threads·W)`: no gap, no
    duplicate, no overrun into the neighbouring thread's span. This is what
    guards the ±i walk, whose failure mode is silently losing or repeating
    candidates rather than producing wrong keys. Checked for a power-of-two
    window, a "half" window, and more than one thread.
+7. **Repeat rules** — `--repeat-nibble` alone, and both repeat rules together
+   with a prefix list, must record exactly what the equivalent explicit prefix
+   list records (16 and 274 entries). The nibble rule uses an odd length, where
+   the digits are not a contiguous run of bits.
+8. **Hit probability** — for several mixes of nested, overlapping and redundant
+   prefixes and rules, every 5-digit key is enumerated; the matching fraction
+   must equal the computed estimate exactly, and dropping redundant criteria
+   must not change which keys match.
 
 The affine `y`-only formula in the search kernel is validated end-to-end too:
 every hit is independently re-derived on the host via the *projective*
-`scalarmult` path and prefix-checked before being printed, so a wrong affine
+`scalarmult` path and checked against the full criterion before being printed, so a wrong affine
 result could never produce output.
 
 ## Layout

@@ -35,26 +35,63 @@ average. As a rough guide at ~700 Mkeys/s: 6 nibbles ≈ instant, 8 nibbles ≈
 Those are averages, not deadlines — the search is memoryless, so being twice
 over the average means nothing is wrong. While hunting the first key the
 progress line shows the actual figure of merit: the chance a match was already
-inside the span searched so far, `1 - (1 - 2^-bits)^attempts`. It crosses 50%
-around the average and 95% at about three times it.
+inside the span searched so far, `1 - (1 - p)^attempts`, where `p` is the
+per-candidate chance of meeting any of your criteria. It
+crosses 50% around the average and 95% at about three times it.
 
 ### Can I match multiple prefixes, a suffix, or a regex?
-Not currently — one prefix per run. The per-candidate cost is dominated by the
-field arithmetic, so extra matching is cheap in principle, but it is not
-implemented. Run separate instances for separate prefixes (one GPU handles one
-instance at full speed; two instances on one GPU roughly halve each).
+Multiple prefixes: yes — pass them all and any hit counts, which divides the
+expected time by their number:
 
-### Why is the max prefix 63 nibbles and not 64?
-The in-kernel filter matches the low 255 bits of the public key (the `y`
-coordinate); bit 255 is the `x`-parity sign and isn't used for filtering. The
-displayed key is always the full, correct 256-bit compressed key. 63 nibbles is
-irrelevant in practice — no one searches prefixes that long.
+```
+./meshcore-vanity beef cafe f00d
+```
+
+Running one instance per prefix instead would be strictly worse: the instances
+split the GPU, so each tests one prefix at a fraction of the throughput, while a
+list tests all of them against the same arithmetic.
+
+The list costs about 1.5% of throughput per entry — 3.5% for two prefixes, 14%
+for eight — so the trade stays lopsided in your favour well past a dozen. A
+single prefix uses a separate kernel and pays nothing for the feature.
+
+Suffixes and regexes are not supported. A suffix would need the *high* bits of
+the key, which cost much more to extract than the low ones the prefix filter
+uses (see [README → Checking the prefix](README.md#checking-the-prefix-without-packing-the-key)).
+
+### I don't care which digits — I just want a "pretty" key.
+Use the repeat rules; they combine with each other and with prefixes:
+
+```
+./meshcore-vanity --repeat-nibble 9            # 000000000…, AAAAAAAAA…
+./meshcore-vanity --repeat-byte 5              # ABABABABAB…, also 5555555555…
+./meshcore-vanity --repeat-nibble 9 --repeat-byte 5 cafe
+```
+
+"Any of 16 digits" is worth one digit, "any of 256 bytes" one whole byte: nine
+identical digits cost as much as a specific 8-digit prefix, and so do five
+identical bytes. The check is as cheap as a single prefix, unlike listing the
+16 or 256 variants as prefixes (~20% of the throughput, or most of it). The
+`Repeat:` line of a hit gives the run the key actually has, which may be longer
+than asked.
+
+### What is the longest prefix?
+64 hex digits, the whole key. The GPU only pre-filters on the first 16 digits;
+every candidate that passes is recomputed on the host as the full compressed key
+and checked against the whole criterion. No one will ever find more than ~16
+anyway.
 
 ### Is my search reproducible / can it repeat work?
-The base counter starts from a random clamped value and advances by exactly the
-span covered each launch, so intervals are contiguous and never overlap within a
-process — no batch is ever recomputed. Different runs start from a fresh random
-base.
+No and no. Every GPU thread starts from its own random base scalar and walks a
+contiguous run from it, never revisiting a candidate; runs of different threads
+start at random points of a 2²⁵¹-sized space, so they do not meet. Every run of
+the program draws new bases.
+
+### Are several keys from one run related?
+No. A key is its thread's base plus a known small offset, so two keys from one
+base would be trivially related. That is why a thread gives at most one key per
+base: after a hit it gets a fresh random base. `--limit N` therefore prints N
+independent keys.
 
 ### `version 'GLIBC_2.38' not found` on Ubuntu 22.04?
 The released binary is built to keep its highest glibc symbol at 2.34, so it runs
@@ -92,5 +129,10 @@ per-block budget); anything larger is clamped with a message.
 
 ### Is it safe? Is my private key exposed?
 The private key is generated locally on your machine and only printed to stdout —
-nothing is sent anywhere. As with any vanity generator: keep the output private,
-and prefer keys you generated yourself over any shared by a third party.
+nothing is sent anywhere. Both halves of it (the scalar, via the thread's base,
+and the 32-byte signing half) come straight from the operating system's
+cryptographic random source (`getrandom` on Linux, `BCryptGenRandom` on
+Windows). The signing half matters as much as the scalar: MeshCore derives every
+signature's nonce from it, so anyone who knew it could recover the scalar from a
+single signature. As with any vanity generator: keep the output private, and
+prefer keys you generated yourself over any shared by a third party.

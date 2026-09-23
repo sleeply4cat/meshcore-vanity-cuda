@@ -2,14 +2,16 @@
 //
 // Algorithm (see README): pubkey(s+8) = pubkey(s) + 8*B, so instead of a full
 // fixed-base scalar multiplication per candidate we do ONE point addition
-// (P += 8B) and amortize the field inversion over a window of WINDOW
-// candidates with Montgomery's batch-inversion trick.
+// (P += 8B) and amortize the field inversion over a window of W candidates
+// with Montgomery's batch-inversion trick.
 //
-// Each thread g owns candidates s = base + (g*WINDOW + j)*8, j in [0,WINDOW).
-// One fixed-base multiply computes the *centre* of that span, then the window is
-// walked outwards in +/-i pairs: since -Q = (-x, y), one table entry i*D yields
-// both s = centre +/- 8i, so a window of W candidates needs only W/2 table
-// entries and W/2 batch-inversion slots.
+// Every thread g has its own random base scalar and, in its k-th launch since
+// that base was drawn, owns candidates s = base_g + (k*W + j)*8, j in [0,W). It
+// walks that span outwards from the centre in +/-i pairs: since -Q = (-x, y),
+// one table entry i*D yields both s = centre +/- 8i, so a window of W candidates
+// needs only W/2 table entries and W/2 batch-inversion slots. The centre point
+// costs a fixed-base multiply only when the base is drawn; after that the
+// thread carries it from launch to launch.
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,19 @@
 #include <random>
 #include <chrono>
 
+#ifdef _WIN32
+// Declared by hand rather than through <windows.h>/<bcrypt.h>, whose macros
+// (min, max, near, far, ...) do not mix well with the rest of this file.
+extern "C" __declspec(dllimport) long __stdcall BCryptGenRandom(void *, unsigned char *,
+                                                                unsigned long, unsigned long);
+#pragma comment(lib, "bcrypt.lib")
+#else
+#include <sys/random.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#endif
+
 #include "ed25519.cuh"
 
 // Window = candidates per thread per launch (batch size). It is chosen at
@@ -32,16 +47,20 @@
 // Supported windows, descending. The single per-thread buffer (pref) holds one
 // prefix product per +/-i PAIR, i.e. W/2 elements = W*20 bytes of local memory,
 // so W=16384 = 320 KB/thread, still under the 512 KB per-thread local limit
-// (numerators and denominators are recomputed, not stored). Bigger windows
-// amortize the two per-window inversions over more candidates but reserve much
-// more VRAM (16384 needs a 16 GB+ GPU); pick them with --window. The 1.5x
-// "half" windows (1536/3072/6144/12288) fill the gaps between powers of two so
-// a size can be chosen closer to what VRAM allows; all are multiples of 512
-// (a warp is 32, a default block 256) for clean local-frame/table alignment.
+// (numerators and denominators are recomputed, not stored). A bigger window
+// amortizes the one per-window inversion over more candidates, but that is
+// worth under ~1.3% past W=2048 while the VRAM reserve grows with W (at 16384
+// it is ~7.7 GB on a 16-SM GPU); pick one with --window. The 1.5x "half"
+// windows (1536/3072/6144/12288) fill the gaps between powers of two so a size
+// can be chosen closer to what VRAM allows; all are multiples of 512 (a warp is
+// 32, a default block 256) for clean local-frame/table alignment.
 static const int kWindows[] = {16384, 12288, 8192, 6144, 4096, 3072, 2048,
                                1536, 1024, 512, 256, 128, 64};
 
-#define RESULT_CAP 4096      // max matches recorded per launch
+// Max matches recorded per launch. With several criteria the hit rate is their
+// sum, so this needs headroom; overflow is reported rather than silently
+// dropped.
+#define RESULT_CAP 65536
 
 // -------------------------------------------------------------------------
 // 256-bit little-endian helpers (host + device)
@@ -117,9 +136,10 @@ __global__ void build_step_table_kernel(bignum25519 *gx, bignum25519 *gy, bignum
 
 // -------------------------------------------------------------------------
 // Affine coords of D = (units*8)*B, the point every thread adds to its window
-// centre between launches, plus PD = xD*yD. `units` is total_threads * window,
-// i.e. exactly the span the host adds to `base`, so the persistent walk and the
-// host counter stay in lockstep. Runs once per configuration; single thread.
+// centre between launches, plus PD = xD*yD. `units` is the window W: a thread
+// covers exactly W candidates per launch, so its next window starts W*8 further
+// on, and the host's per-thread launch count stays in lockstep with the point.
+// Runs once per configuration; single thread.
 // -------------------------------------------------------------------------
 __global__ void build_launch_step_kernel(bignum25519 *out3, unsigned long long units) {
     uint8_t s[32];
@@ -187,13 +207,68 @@ __device__ static uint64_t curve25519_contract_lo64(const bignum25519 in) {
 }
 
 // -------------------------------------------------------------------------
+// Candidate filters. Each answers one question about the low 64 bits of the
+// compressed key (pub[0] in the low byte), and the search kernel takes the
+// filter as a template parameter, so every search mode is its own kernel: the
+// single-prefix one compiles to exactly one masked compare. (Making it share
+// code with the list scan behind a runtime branch measured ~0.7% slower.)
+//
+// No filter looks past the first 8 bytes. A criterion longer than that would
+// need ~2^64 candidates to produce even a false positive here, and the host
+// re-derives and fully re-checks every hit anyway.
+// -------------------------------------------------------------------------
+struct FilterOne {
+    unsigned long long req8, mask8;
+    __device__ __forceinline__ bool operator()(uint64_t lo) const {
+        return ((lo ^ req8) & mask8) == 0;
+    }
+};
+
+struct FilterList {
+    const unsigned long long *__restrict__ req8;
+    const unsigned long long *__restrict__ mask8;
+    int n;
+    __device__ __forceinline__ bool operator()(uint64_t lo) const {
+        for (int j = 0; j < n; j++)
+            if (((lo ^ req8[j]) & mask8[j]) == 0) return true;
+        return false;
+    }
+};
+
+// "The key starts with one unit repeated": broadcast the first unit of the key
+// (its low nibble or low byte) across the word and compare under the mask of
+// the digits that must match. Broadcasting rather than comparing neighbours
+// matters for nibbles: the key prints each byte high nibble first, so an odd
+// number of leading digits is not a contiguous run of bits in `lo`. Which unit
+// happens to be broadcast does not matter — they must all be equal.
+//   nibble: unit 0xF,  mult 0x1111111111111111
+//   byte:   unit 0xFF, mult 0x0101010101010101
+template <int K>
+struct FilterRepeat {
+    uint64_t unit[K], mult[K], mask[K];
+    __device__ __forceinline__ bool operator()(uint64_t lo) const {
+        bool hit = false;
+#pragma unroll
+        for (int k = 0; k < K; k++)
+            hit |= ((lo ^ ((lo & unit[k]) * mult[k])) & mask[k]) == 0;
+        return hit;
+    }
+};
+
+template <class A, class B>
+struct FilterEither {
+    A a; B b;
+    __device__ __forceinline__ bool operator()(uint64_t lo) const { return a(lo) || b(lo); }
+};
+
+// -------------------------------------------------------------------------
 // Main search kernel — affine batched-addition walk in +/-i pairs (y only).
 //
 // For candidate i (scalar s0 + i*8) the point is P0 + i*D. Using the complete
 // twisted-Edwards (a=-1) addition and keeping only y:
 //     y_i = (x0*x_i + y0*y_i) / (1 - d*x0*y0 * x_i*y_i)
-// where (x0,y0) is the window-CENTRE point (one fixed-base multiply per thread)
-// and (x_i, y_i, P_i=x_i*y_i) come from the shared precomputed step table.
+// where (x0,y0) is the window-CENTRE point and (x_i, y_i, P_i=x_i*y_i) come
+// from the shared precomputed step table.
 //
 // Negating a point flips only x (-Q = (-x, y)), so ONE table entry gives two
 // candidates. With A = x0*x_i, B = y0*y_i and C = K*P_i (K = d*x0*y0, computed
@@ -216,55 +291,43 @@ __device__ static uint64_t curve25519_contract_lo64(const bignum25519 in) {
 // pins it to the useful side of that cliff, and does it in the source, so every
 // build path (Makefile, `make release`, the Windows CI nvcc line) inherits it.
 #define VANITY_MAX_TPB 384
-template <int W>
-__global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(const uint8_t *__restrict__ base,
-                              const bignum25519 *__restrict__ gx,
-                              const bignum25519 *__restrict__ gy,
-                              const bignum25519 *__restrict__ gp,
-                              const uint8_t *__restrict__ req,
-                              const uint8_t *__restrict__ mask,
-                              int prefix_len,
-                              unsigned long long *__restrict__ out_count,
-                              unsigned long long *__restrict__ out_units,
-                              const bignum25519 *__restrict__ dstep,
-                              bignum25519 *__restrict__ sx,
-                              bignum25519 *__restrict__ sy,
-                              int have_state) {
+
+template <int W, class Filter>
+__global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
+        const uint8_t *__restrict__ bases,
+        const bignum25519 *__restrict__ gx, const bignum25519 *__restrict__ gy,
+        const bignum25519 *__restrict__ gp,
+        unsigned long long *__restrict__ out_count,
+        unsigned long long *__restrict__ out_units,
+        const bignum25519 *__restrict__ dstep,
+        bignum25519 *__restrict__ sx, bignum25519 *__restrict__ sy,
+        uint8_t *__restrict__ fresh,
+        Filter match) {
     const int H = W / 2;
     const unsigned long long gid =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    // The thread still owns units [gid*W, gid*W + W); it just works outwards
-    // from the middle of that span, so the covered range (and hence the clamp
-    // and no-overlap analysis) is exactly as before.
+    // Recorded hits are numbered gid*W + j, j in [0,W) the candidate's place in
+    // this thread's window, so the host can tell threads apart; the scalar is
+    // base_gid + (k*W + j)*8 for the thread's k-th launch on that base.
     const unsigned long long centre_unit = gid * (unsigned long long)W + (unsigned long long)H;
 
-    // Pack the first (up to) 8 prefix bytes into one masked 64-bit comparison.
-    // Keeping them as byte arrays would cost a dynamically indexed register
-    // array in the innermost loop, which nvcc lowers to a select chain — worth
-    // ~5% of total throughput. Longer prefixes fall back to a byte compare that
-    // only a 1-in-2^64 candidate ever reaches.
-    uint64_t req8 = 0, mask8 = 0;
-    for (int i = 0; i < 8 && i < prefix_len; i++) {
-        req8  |= (uint64_t)req[i]  << (8 * i);
-        mask8 |= (uint64_t)mask[i] << (8 * i);
-    }
-
-    // The window-centre affine point. On the first launch of a configuration it
-    // costs a fixed-base comb plus an inversion (~600 field multiplies); after
-    // that the thread just picks up where it left off, because the host advances
-    // `base` by exactly the span covered and this kernel advances the point by
-    // the matching multiple of B (see the tail of this function).
+    // The window-centre affine point. When the thread has a fresh base (first
+    // launch, or the host re-drew it after a hit) it costs a fixed-base comb
+    // plus an inversion (~600 field multiplies); otherwise the thread picks up
+    // the point it left behind, advanced by exactly one window (see the tail of
+    // this function).
     bignum25519 x0, y0;
-    if (have_state) {
-        curve25519_copy(x0, sx[gid]);
-        curve25519_copy(y0, sy[gid]);
-    } else {
+    if (fresh[gid]) {
         uint8_t s0[32];
-        scalar_add_u64(s0, base, centre_unit * 8ULL);
+        scalar_add_u64(s0, bases + gid * 32, (unsigned long long)H * 8ULL);
         clamp_scalar(s0);
         ge25519 P;
         scalar_to_point(&P, s0);
         ge_to_affine(x0, y0, &P);
+        fresh[gid] = 0;
+    } else {
+        curve25519_copy(x0, sx[gid]);
+        curve25519_copy(y0, sy[gid]);
     }
 
     // K = d * x0 * y0  (per-thread constant for the denominator).
@@ -275,15 +338,9 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(const uint8_t *_
     bignum25519 one; for (int k = 0; k < 10; k++) one[k] = 0; one[0] = 1;
 
     auto check_and_record = [&](const bignum25519 y, unsigned long long unit) {
-        // Matches the low 255 bits of y (bit 255 = x parity is ignored; the
-        // host recomputes the full compressed key for any hit).
-        if ((curve25519_contract_lo64(y) ^ req8) & mask8) return;
-        if (prefix_len > 8) {                          // effectively never taken
-            unsigned char pub[32];
-            curve25519_contract(pub, y);
-            for (int i = 8; i < prefix_len; i++)
-                if ((pub[i] & mask[i]) != req[i]) return;
-        }
+        // Matches the low bits of y (bit 255 = x parity is ignored; the host
+        // recomputes the full compressed key for any hit).
+        if (!match(curve25519_contract_lo64(y))) return;
         unsigned long long slot = atomicAdd(out_count, 1ULL);
         if (slot < RESULT_CAP) out_units[slot] = unit;
     };
@@ -341,8 +398,8 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(const uint8_t *_
         check_and_record(y, centre_unit - (unsigned long long)i);
 
         // centre + 8i : y = (B + A) / (1 - C),  1/(1-C) = (1+C) * invprod.
-        // i == H would land on the next thread's first unit, so skip it — the
-        // span stays exactly W units wide and threads never overlap.
+        // i == H would land on the next window's first unit, so skip it — the
+        // span stays exactly W units wide and windows never overlap.
         if (i < H) {
             curve25519_add_reduce(den, one, c);
             curve25519_mul(den, den, invprod);
@@ -352,11 +409,10 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(const uint8_t *_
         }
     }
 
-    // Advance the thread's centre by D = (total_threads * W * 8) * B, which is
-    // exactly the span the host adds to `base`, and hand it to the next launch.
-    // Every pair denominator has now been stripped from `acc`, so what is left
-    // is 1/((1-Cs)(1+Cs)) — the seed slot — and the two affine addition
-    // denominators come out of it with one multiply each:
+    // Advance the thread's centre by D = (W * 8) * B, one window, and hand it to
+    // the next launch. Every pair denominator has now been stripped from `acc`,
+    // so what is left is 1/((1-Cs)(1+Cs)) — the seed slot — and the two affine
+    // addition denominators come out of it with one multiply each:
     //     x' = (x0 yD + y0 xD) / (1 + Cs),   1/(1+Cs) = (1 - Cs) * acc
     //     y' = (y0 yD + x0 xD) / (1 - Cs),   1/(1-Cs) = (1 + Cs) * acc
     {
@@ -380,11 +436,9 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(const uint8_t *_
 }
 
 // -------------------------------------------------------------------------
-// Host-callable single-key pack: full compressed pubkey (incl. parity) for a
-// given clamped scalar. Used to verify/display hits.
-// -------------------------------------------------------------------------
 // Selftest helper: contract both ways so the host can check that the fast
 // low-64-bit packing agrees with donna's full 32-byte contract.
+// -------------------------------------------------------------------------
 __global__ void contract_lo64_kernel(const bignum25519 *__restrict__ in, int n,
                                      uint8_t *__restrict__ out32,
                                      unsigned long long *__restrict__ out_lo) {
@@ -394,6 +448,8 @@ __global__ void contract_lo64_kernel(const bignum25519 *__restrict__ in, int n,
     out_lo[i] = curve25519_contract_lo64(in[i]);
 }
 
+// Host-callable single-key pack: full compressed pubkey (incl. parity) for a
+// given clamped scalar. Used to verify/display hits.
 __global__ void pack_one_kernel(const uint8_t *__restrict__ scalar, uint8_t *__restrict__ pub) {
     ge25519 P;
     scalar_to_point(&P, scalar);
@@ -443,28 +499,84 @@ static void cuda_check(cudaError_t e, const char *what) {
     }
 }
 
+// Key material comes straight from the OS CSPRNG. The private key is the base
+// scalar plus a known small offset, and the signing half seeds every signature
+// nonce, so both carry exactly the entropy of this source: a seeded userspace
+// PRNG would cap them at the size of its seed.
+static void fill_random(uint8_t *p, size_t n) {
+#ifdef _WIN32
+    while (n) {
+        unsigned long chunk = n > (1u << 30) ? (1u << 30) : (unsigned long)n;
+        // 2 = BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        if (BCryptGenRandom(nullptr, p, chunk, 2) != 0) {
+            fprintf(stderr, "BCryptGenRandom failed\n");
+            exit(1);
+        }
+        p += chunk; n -= chunk;
+    }
+#else
+    while (n) {
+        ssize_t r = getrandom(p, n, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && errno == ENOSYS) {                // pre-3.17 kernel
+            int fd = open("/dev/urandom", O_RDONLY);
+            while (fd >= 0 && n) {
+                ssize_t k = read(fd, p, n);
+                if (k < 0 && errno == EINTR) continue;
+                if (k <= 0) break;
+                p += k; n -= (size_t)k;
+            }
+            if (fd >= 0) close(fd);
+            if (n == 0) return;
+        }
+        if (r <= 0) {
+            fprintf(stderr, "Cannot read the system random source\n");
+            exit(1);
+        }
+        p += r; n -= (size_t)r;
+    }
+#endif
+}
+
+// n independent random clamped base scalars, 32 bytes each.
+static void random_bases(uint8_t *p, size_t n) {
+    fill_random(p, n * 32);
+    for (size_t i = 0; i < n; i++) clamp_scalar(p + i * 32);
+}
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
 // Parse a hex prefix into (req, mask) byte vectors, like the reference
-// build_matcher_from_hex. Returns prefix_len in bytes.
+// build_matcher_from_hex. The caller has validated the characters. Returns
+// prefix_len in bytes.
 static int build_matcher(const std::string &hex, std::vector<uint8_t> &req,
                          std::vector<uint8_t> &mask) {
-    std::vector<uint8_t> nibbles;
-    for (char c : hex) {
-        char lc = (char)tolower((unsigned char)c);
-        int v;
-        if (lc >= '0' && lc <= '9') v = lc - '0';
-        else if (lc >= 'a' && lc <= 'f') v = 10 + lc - 'a';
-        else { fprintf(stderr, "Invalid hex character in prefix: '%c'\n", c); exit(1); }
-        nibbles.push_back((uint8_t)v);
-    }
-    int full_bytes = (int)(nibbles.size() + 1) / 2;
+    int full_bytes = (int)(hex.size() + 1) / 2;
     req.assign(full_bytes, 0);
     mask.assign(full_bytes, 0);
-    for (size_t i = 0; i < nibbles.size(); i++) {
-        int bi = (int)i / 2;
-        if (i % 2 == 0) { req[bi] |= nibbles[i] << 4; mask[bi] |= 0xF0; }
-        else            { req[bi] |= nibbles[i];      mask[bi] |= 0x0F; }
+    for (size_t i = 0; i < hex.size(); i++) {
+        int bi = (int)i / 2, v = hexval(hex[i]);
+        if (i % 2 == 0) { req[bi] |= v << 4; mask[bi] |= 0xF0; }
+        else            { req[bi] |= v;      mask[bi] |= 0x0F; }
     }
     return full_bytes;
+}
+
+// The first (up to) 8 bytes of a prefix as one masked 64-bit comparison.
+static void pack_prefix(const std::string &hex, unsigned long long &req8,
+                        unsigned long long &mask8) {
+    std::vector<uint8_t> req, mask;
+    int len = build_matcher(hex, req, mask);
+    req8 = mask8 = 0;
+    for (int i = 0; i < 8 && i < len; i++) {
+        req8  |= (unsigned long long)req[i]  << (8 * i);
+        mask8 |= (unsigned long long)mask[i] << (8 * i);
+    }
 }
 
 static std::string hex_upper(const uint8_t *p, int n) {
@@ -475,25 +587,211 @@ static std::string hex_upper(const uint8_t *p, int n) {
     return s;
 }
 
+static std::string upper(std::string s) {
+    for (char &c : s) c = (char)toupper((unsigned char)c);
+    return s;
+}
+
 // Minimal base-10 parser for CLI integers. Deliberately avoids atoi/atol/strtol:
 // with a recent GCC/glibc those get redirected to __isoc23_strtol (GLIBC_2.38),
 // which would break the binary on older distros (e.g. Ubuntu 22.04 / glibc 2.35).
-// This keeps the highest required glibc symbol at 2.34.
-static long parse_long(const char *s) {
-    while (*s == ' ' || *s == '\t') s++;
-    long sign = 1;
-    if (*s == '+') s++;
-    else if (*s == '-') { sign = -1; s++; }
+// This keeps the highest required glibc symbol at 2.34. Anything but plain
+// digits is rejected, so a typo cannot silently become 0.
+static long parse_num(const char *s, const char *opt) {
     long v = 0;
-    for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
-    return sign * v;
+    const char *p = s;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        v = v * 10 + (*p - '0');
+        if (v > 1000000000L) break;
+    }
+    if (p == s || *p) {
+        fprintf(stderr, "%s expects a non-negative number, got '%s'\n", opt, s);
+        exit(1);
+    }
+    return v;
 }
 
-static void fill_random(uint8_t *p, int n) {
-    static std::random_device rd;
-    static std::mt19937_64 gen(((uint64_t)rd() << 32) ^ rd());
-    for (int i = 0; i < n; i++) p[i] = (uint8_t)(gen() & 0xff);
+// -------------------------------------------------------------------------
+// Search criteria: hex prefixes and repeat rules. A key counts when it meets
+// any of them. Everything here works on the key's hex digits ("nibbles"), in
+// the order the key prints.
+// -------------------------------------------------------------------------
+
+// The first `n` hex digits are one `u`-digit unit repeated: u = 1 is AAAA...,
+// u = 2 is ABABAB... (the same byte n/2 times).
+struct RepeatRule { int n, u; };
+
+struct Criteria {
+    std::vector<std::string> prefixes;     // lowercase hex
+    std::vector<RepeatRule> rules;         // at most one per unit size
+};
+
+static void key_nibbles(const uint8_t pub[32], uint8_t nib[64]) {
+    for (int i = 0; i < 32; i++) { nib[2 * i] = pub[i] >> 4; nib[2 * i + 1] = pub[i] & 0xF; }
 }
+
+static std::vector<uint8_t> str_nibbles(const std::string &hex) {
+    std::vector<uint8_t> v;
+    for (char c : hex) v.push_back((uint8_t)hexval(c));
+    return v;
+}
+
+static bool is_periodic(const uint8_t *nib, int len, int u) {
+    for (int i = u; i < len; i++) if (nib[i] != nib[i - u]) return false;
+    return true;
+}
+
+// Length of the leading run of the key that repeats its first u digits.
+static int periodic_len(const uint8_t *nib, int len, int u) {
+    int i = u;
+    while (i < len && nib[i] == nib[i - u]) i++;
+    return i;
+}
+
+static bool nib_has_prefix(const uint8_t *nib, const std::vector<uint8_t> &p) {
+    for (size_t i = 0; i < p.size(); i++) if (nib[i] != p[i]) return false;
+    return true;
+}
+
+// Which criterion a key (given as nibbles) meets: the index of a prefix, or
+// prefixes.size() + the index of a rule, or -1. Prefixes are tried first.
+static int match_nibbles(const Criteria &c, const uint8_t *nib, int len) {
+    for (size_t j = 0; j < c.prefixes.size(); j++)
+        if ((int)c.prefixes[j].size() <= len && nib_has_prefix(nib, str_nibbles(c.prefixes[j])))
+            return (int)j;
+    for (size_t r = 0; r < c.rules.size(); r++)
+        if (c.rules[r].n <= len && is_periodic(nib, c.rules[r].n, c.rules[r].u))
+            return (int)(c.prefixes.size() + r);
+    return -1;
+}
+
+// Rule a => rule b (every key meeting a meets b).
+static bool rule_implies(RepeatRule a, RepeatRule b) {
+    return b.u % a.u == 0 && a.n >= b.n;
+}
+
+// Prefix p => rule r.
+static bool prefix_implies(const std::string &p, RepeatRule r) {
+    std::vector<uint8_t> v = str_nibbles(p);
+    return (int)v.size() >= r.n && is_periodic(v.data(), r.n, r.u);
+}
+
+// Drop criteria that another one already covers: exact and nested duplicate
+// prefixes ("abcd" when "ab" is there), prefixes a rule covers, and a rule
+// another rule covers. This costs nothing in the result — the union is the
+// same — but it saves filter work, and it makes the remaining prefixes
+// pairwise disjoint, which the probability below relies on.
+static void normalize(Criteria &c, bool verbose) {
+    for (std::string &p : c.prefixes)
+        for (char &ch : p) ch = (char)tolower((unsigned char)ch);
+    std::stable_sort(c.prefixes.begin(), c.prefixes.end(),
+                     [](const std::string &a, const std::string &b) { return a.size() < b.size(); });
+
+    std::vector<RepeatRule> rules;
+    for (size_t i = 0; i < c.rules.size(); i++) {
+        bool covered = false;
+        for (size_t k = 0; k < c.rules.size() && !covered; k++)
+            if (k != i && rule_implies(c.rules[i], c.rules[k]) &&
+                !(rule_implies(c.rules[k], c.rules[i]) && k > i))
+                covered = true;
+        if (covered) {
+            if (verbose)
+                fprintf(stderr, "Note: --repeat-nibble %d is already covered by --repeat-byte; dropped.\n",
+                        c.rules[i].n);
+        } else rules.push_back(c.rules[i]);
+    }
+    c.rules = rules;
+
+    std::vector<std::string> kept;
+    for (const std::string &p : c.prefixes) {
+        const char *why = nullptr; std::string by;
+        for (const std::string &q : kept)
+            if (p.compare(0, q.size(), q) == 0) { why = "prefix"; by = q; break; }
+        for (size_t r = 0; !why && r < c.rules.size(); r++)
+            if (prefix_implies(p, c.rules[r])) why = c.rules[r].u == 1 ? "--repeat-nibble" : "--repeat-byte";
+        if (!why) { kept.push_back(p); continue; }
+        if (verbose) {
+            if (by.empty()) fprintf(stderr, "Note: prefix %s is already covered by %s; dropped.\n",
+                                    upper(p).c_str(), why);
+            else fprintf(stderr, "Note: prefix %s is already covered by prefix %s; dropped.\n",
+                         upper(p).c_str(), upper(by).c_str());
+        }
+    }
+    c.prefixes = kept;
+}
+
+static double p_digits(int k) { return ldexp(1.0, -4 * k); }   // 16^-k
+
+static double p_rule(RepeatRule r) { return p_digits(r.n - r.u); }
+
+// P(key starts with prefix p AND meets rule r).
+static double p_prefix_and_rule(const std::string &p, RepeatRule r) {
+    std::vector<uint8_t> v = str_nibbles(p);
+    const int L = (int)v.size();
+    if (!is_periodic(v.data(), std::min(L, r.n), r.u)) return 0;
+    if (L >= r.n) return p_digits(L);                  // p implies r
+    // The prefix fixes min(L, u) digits of the unit; the rest are free.
+    return p_digits(r.n - (r.u - std::min(L, r.u)));
+}
+
+// Per-candidate probability of meeting any criterion, exact by
+// inclusion-exclusion. Needs normalize() first: prefixes are then pairwise
+// disjoint. Two rules (nibble n1, byte n2 digits, n1 < n2 after normalize)
+// intersect in "n2 identical digits", itself a nibble rule.
+static double hit_probability(const Criteria &c) {
+    std::vector<RepeatRule> both;
+    if (c.rules.size() == 2)
+        both.push_back({std::max(c.rules[0].n, c.rules[1].n), std::min(c.rules[0].u, c.rules[1].u)});
+    double p = 0;
+    for (RepeatRule r : c.rules) p += p_rule(r);
+    for (RepeatRule r : both) p -= p_rule(r);
+    for (const std::string &s : c.prefixes) {
+        p += p_digits((int)s.size());
+        for (RepeatRule r : c.rules) p -= p_prefix_and_rule(s, r);
+        for (RepeatRule r : both) p += p_prefix_and_rule(s, r);
+    }
+    return p;
+}
+
+// Low-64-bit mask of the first min(n, 16) hex digits (each byte high nibble
+// first, pub[0] in the low byte).
+static unsigned long long digit_mask(int n) {
+    unsigned long long m = 0;
+    for (int i = 0; i < n && i < 16; i++) m |= 0xFULL << (8 * (i / 2) + ((i & 1) ? 0 : 4));
+    return m;
+}
+
+template <int K>
+static FilterRepeat<K> make_repeat(const std::vector<RepeatRule> &rules) {
+    FilterRepeat<K> f;
+    for (int k = 0; k < K; k++) {
+        f.unit[k] = rules[k].u == 1 ? 0xFULL : 0xFFULL;
+        f.mult[k] = rules[k].u == 1 ? 0x1111111111111111ULL : 0x0101010101010101ULL;
+        f.mask[k] = digit_mask(rules[k].n);
+    }
+    return f;
+}
+
+// A prefix list in device memory, for FilterList.
+struct DevList {
+    unsigned long long *req8 = nullptr, *mask8 = nullptr;
+    int n = 0;
+    explicit DevList(const std::vector<std::string> &prefixes) : n((int)prefixes.size()) {
+        if (!n) return;
+        std::vector<unsigned long long> r(n), m(n);
+        for (int j = 0; j < n; j++) pack_prefix(prefixes[j], r[j], m[j]);
+        cuda_check(cudaMalloc(&req8, sizeof(unsigned long long) * n), "malloc req8");
+        cuda_check(cudaMalloc(&mask8, sizeof(unsigned long long) * n), "malloc mask8");
+        cuda_check(cudaMemcpy(req8, r.data(), sizeof(unsigned long long) * n,
+                              cudaMemcpyHostToDevice), "memcpy req8");
+        cuda_check(cudaMemcpy(mask8, m.data(), sizeof(unsigned long long) * n,
+                              cudaMemcpyHostToDevice), "memcpy mask8");
+    }
+    ~DevList() { cudaFree(req8); cudaFree(mask8); }
+    DevList(const DevList &) = delete;
+    DevList &operator=(const DevList &) = delete;
+    FilterList filter() const { return FilterList{req8, mask8, n}; }
+};
 
 // Pack one clamped scalar -> full compressed pubkey (device round-trip).
 static void pack_one(const uint8_t scalar[32], uint8_t pub[32],
@@ -504,60 +802,44 @@ static void pack_one(const uint8_t scalar[32], uint8_t pub[32],
     cuda_check(cudaMemcpy(pub, d_pub, 32, cudaMemcpyDeviceToHost), "memcpy pub");
 }
 
-// Kernel launch args, bundled so the window dispatch stays readable.
+// Kernel launch args (everything but the filter), bundled so the window
+// dispatch stays readable.
 struct LaunchArgs {
-    const uint8_t *base; const bignum25519 *gx, *gy, *gp;
-    const uint8_t *req, *mask; int prefix_len;
+    const uint8_t *bases;                // per-thread base scalars, 32 bytes each
+    const bignum25519 *gx, *gy, *gp;
     unsigned long long *count, *units;
     const bignum25519 *dstep;            // affine (xD, yD, xD*yD) of the launch step
     bignum25519 *sx, *sy;                // persistent per-thread centre point
-    int have_state;                      // 0 = seed from `base` (first launch)
+    uint8_t *fresh;                      // per thread: 1 = seed from its base
 };
 
-// Launch the vanity kernel instantiation for a runtime window. Returns the
-// launch error (e.g. cudaErrorMemoryAllocation if the local frame won't fit).
-static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchArgs &a) {
-#define LV(W) vanity_kernel<W><<<blocks, tpb>>>(a.base, a.gx, a.gy, a.gp, a.req, a.mask, \
-                                                a.prefix_len, a.count, a.units,          \
-                                                a.dstep, a.sx, a.sy, a.have_state)
+// Launch the vanity kernel instantiation for a runtime window and filter.
+// Returns the launch error (e.g. cudaErrorMemoryAllocation if the local frame
+// won't fit).
+template <class F>
+static cudaError_t launch_vanity(int window, int blocks, int tpb, const LaunchArgs &a, const F &f) {
+#define LV(W) case W: vanity_kernel<W, F><<<blocks, tpb>>>(a.bases, a.gx, a.gy, a.gp, \
+                  a.count, a.units, a.dstep, a.sx, a.sy, a.fresh, f); break;
     switch (window) {
-        case 16384: LV(16384); break;
-        case 12288: LV(12288); break;
-        case 8192: LV(8192); break;
-        case 6144: LV(6144); break;
-        case 4096: LV(4096); break;
-        case 3072: LV(3072); break;
-        case 2048: LV(2048); break;
-        case 1536: LV(1536); break;
-        case 1024: LV(1024); break;
-        case 512:  LV(512);  break;
-        case 256:  LV(256);  break;
-        case 128:  LV(128);  break;
-        case 64:   LV(64);   break;
+        LV(16384) LV(12288) LV(8192) LV(6144) LV(4096) LV(3072) LV(2048)
+        LV(1536) LV(1024) LV(512) LV(256) LV(128) LV(64)
         default: return cudaErrorInvalidValue;
     }
 #undef LV
     return cudaGetLastError();
 }
 
-// All vanity_kernel<W> share one signature, so a plain const void* pointer lets
-// the runtime introspection helpers (attributes, occupancy) take a single path.
+// All filters give the kernel the same local frame (the pref buffer), so the
+// runtime introspection helpers (attributes, occupancy) use the single-prefix
+// one.
 static const void *vanity_kernel_ptr(int window) {
+#define KP(W) case W: return (const void *)vanity_kernel<W, FilterOne>;
     switch (window) {
-        case 16384: return (const void *)vanity_kernel<16384>;
-        case 12288: return (const void *)vanity_kernel<12288>;
-        case 8192: return (const void *)vanity_kernel<8192>;
-        case 6144: return (const void *)vanity_kernel<6144>;
-        case 4096: return (const void *)vanity_kernel<4096>;
-        case 3072: return (const void *)vanity_kernel<3072>;
-        case 2048: return (const void *)vanity_kernel<2048>;
-        case 1536: return (const void *)vanity_kernel<1536>;
-        case 1024: return (const void *)vanity_kernel<1024>;
-        case 512:  return (const void *)vanity_kernel<512>;
-        case 256:  return (const void *)vanity_kernel<256>;
-        case 128:  return (const void *)vanity_kernel<128>;
-        default:   return (const void *)vanity_kernel<64>;
+        KP(16384) KP(12288) KP(8192) KP(6144) KP(4096) KP(3072) KP(2048)
+        KP(1536) KP(1024) KP(512) KP(256) KP(128)
+        default: return (const void *)vanity_kernel<64, FilterOne>;
     }
+#undef KP
 }
 
 // Per-thread local memory (bytes) the given window instantiation needs.
@@ -607,20 +889,17 @@ static int auto_window() {
     return kWindows[sizeof(kWindows) / sizeof(kWindows[0]) - 1];  // smallest
 }
 
+// Largest supported window <= req (the smallest one if req is below them all).
 static int nearest_window(int req) {
-    int best = kWindows[0];
-    for (int w : kWindows) if (w <= req) { best = w; break; }  // largest supported <= req
-    // if req smaller than all, fall through to smallest
-    if (req < kWindows[sizeof(kWindows)/sizeof(kWindows[0]) - 1])
-        best = kWindows[sizeof(kWindows)/sizeof(kWindows[0]) - 1];
-    return best;
+    for (int w : kWindows) if (w <= req) return w;
+    return kWindows[sizeof(kWindows) / sizeof(kWindows[0]) - 1];
 }
 
 static int run_selftest();
 static int run_benchmark(int blocks, int tpb);
 
 int main(int argc, char **argv) {
-    std::string prefix;
+    Criteria crit;
     long limit = 1;
     int blocks = 512;
     int tpb = 256;
@@ -630,6 +909,11 @@ int main(int argc, char **argv) {
     bool selftest = false;
     bool benchmark = false;
 
+    auto set_rule = [&](RepeatRule r) {
+        for (RepeatRule &q : crit.rules) if (q.u == r.u) { q = r; return; }
+        crit.rules.push_back(r);
+    };
+
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto need = [&](const char *n) -> const char * {
@@ -638,17 +922,32 @@ int main(int argc, char **argv) {
         };
         if (a == "--selftest") selftest = true;
         else if (a == "--benchmark" || a == "--bench") benchmark = true;
-        else if (a == "-l" || a == "--limit") limit = parse_long(need("--limit"));
-        else if (a == "--blocks") blocks = (int)parse_long(need("--blocks"));
-        else if (a == "--tpb") tpb = (int)parse_long(need("--tpb"));
-        else if (a == "-d" || a == "--device") device = (int)parse_long(need("--device"));
-        else if (a == "-w" || a == "--window") window = (int)parse_long(need("--window"));
+        else if (a == "-l" || a == "--limit") limit = parse_num(need("--limit"), "--limit");
+        else if (a == "--blocks") blocks = (int)parse_num(need("--blocks"), "--blocks");
+        else if (a == "--tpb") tpb = (int)parse_num(need("--tpb"), "--tpb");
+        else if (a == "-d" || a == "--device") device = (int)parse_num(need("--device"), "--device");
+        else if (a == "-w" || a == "--window") window = (int)parse_num(need("--window"), "--window");
+        else if (a == "--repeat-nibble") {
+            long n = parse_num(need("--repeat-nibble"), "--repeat-nibble");
+            if (n < 2 || n > 64) { fprintf(stderr, "--repeat-nibble takes 2..64 digits\n"); return 1; }
+            set_rule({(int)n, 1});
+        }
+        else if (a == "--repeat-byte") {
+            long n = parse_num(need("--repeat-byte"), "--repeat-byte");
+            if (n < 2 || n > 32) { fprintf(stderr, "--repeat-byte takes 2..32 bytes\n"); return 1; }
+            set_rule({(int)(2 * n), 2});
+        }
         else if (a == "--no-progress") progress = false;
         else if (a == "-h" || a == "--help") {
-            printf("Usage: %s <HEX_PREFIX> [options]\n"
-                   "  -l, --limit N     stop after N matches (0 = infinite) [1]\n"
+            printf("Usage: %s [HEX_PREFIX ...] [options]\n"
+                   "  A key counts when it meets ANY of the criteria below; several are\n"
+                   "  searched in one pass, which divides the expected time accordingly.\n"
+                   "  HEX_PREFIX            key starts with these hex digits\n"
+                   "      --repeat-nibble N key starts with N+ identical hex digits (AAAA..)\n"
+                   "      --repeat-byte N   key starts with N+ identical bytes (ABABAB..)\n"
+                   "  -l, --limit N     stop after N matches total (0 = infinite) [1]\n"
                    "  -w, --window N    batch/thr: 64..16384 incl. 1536/3072/6144/12288 [auto VRAM]\n"
-                   "                    bigger = faster but more GPU memory\n"
+                   "                    past ~2048 at most ~1.3%% faster, but much more GPU memory\n"
                    "      --blocks N    CUDA blocks [512]\n"
                    "      --tpb N       threads per block, 32..384 [256]\n"
                    "  -d, --device I    CUDA device index [0]\n"
@@ -659,7 +958,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if (!a.empty() && a[0] == '-') { fprintf(stderr, "Unknown option %s\n", a.c_str()); return 1; }
-        else prefix = a;
+        else crit.prefixes.push_back(a);
     }
 
     // The kernel is compiled with __launch_bounds__(VANITY_MAX_TPB); a larger
@@ -671,6 +970,7 @@ int main(int argc, char **argv) {
         tpb = VANITY_MAX_TPB;
     }
     if (tpb < 32) { fprintf(stderr, "Block size must be at least 32.\n"); return 1; }
+    if (blocks < 1) { fprintf(stderr, "--blocks must be at least 1.\n"); return 1; }
 
     cuda_check(cudaSetDevice(device), "setDevice");
     // Block (sleep) the host thread while waiting on the GPU instead of the
@@ -681,10 +981,24 @@ int main(int argc, char **argv) {
     if (selftest) return run_selftest();
     if (benchmark) return run_benchmark(blocks, tpb);
 
-    if (prefix.empty() || prefix.size() > 64) {
-        fprintf(stderr, "Prefix must be 1-64 hex characters. Use --help.\n");
+    if (crit.prefixes.empty() && crit.rules.empty()) {
+        fprintf(stderr, "Give a hex prefix or a --repeat-* rule. Use --help.\n");
         return 1;
     }
+    for (const std::string &pfx : crit.prefixes) {
+        if (pfx.empty() || pfx.size() > 64) {
+            fprintf(stderr, "Prefix must be 1-64 hex characters: '%s'\n", pfx.c_str());
+            return 1;
+        }
+        for (char c : pfx)
+            if (hexval(c) < 0) {
+                fprintf(stderr, "Invalid hex character in prefix '%s': '%c'\n", pfx.c_str(), c);
+                return 1;
+            }
+    }
+    normalize(crit, true);
+    const int npfx = (int)crit.prefixes.size();
+    const int nrule = (int)crit.rules.size();
 
     // Resolve the window: explicit --window (snapped to a supported size) or
     // auto-fit to free VRAM.
@@ -705,65 +1019,97 @@ int main(int argc, char **argv) {
         window = snap;
     }
 
-    std::vector<uint8_t> req, mask;
-    int prefix_len = build_matcher(prefix, req, mask);
-
+    const double p_hit = hit_probability(crit);    // per-candidate chance of any match
     const unsigned long long threads = (unsigned long long)blocks * tpb;
     unsigned long long per_launch = threads * (unsigned long long)window;
 
-    fprintf(stderr, "Searching for pubkey prefix: ");
-    for (char c : prefix) fputc(toupper((unsigned char)c), stderr);
-    fprintf(stderr, "\n  Req:  %s\n  Mask: %s\n",
-            hex_upper(req.data(), prefix_len).c_str(),
-            hex_upper(mask.data(), prefix_len).c_str());
-    // Expected attempts = 2^(bits set in mask).
-    int bits = 0; for (uint8_t m : mask) bits += __builtin_popcount(m);
-    fprintf(stderr, "Estimated attempts: 2^%d\n", bits);
+    fprintf(stderr, "Searching for keys that match:\n");
+    for (const std::string &p : crit.prefixes) {
+        std::vector<uint8_t> req, mask;
+        int len = build_matcher(p, req, mask);
+        fprintf(stderr, "  prefix %-16s req %s mask %s\n", upper(p).c_str(),
+                hex_upper(req.data(), len).c_str(), hex_upper(mask.data(), len).c_str());
+    }
+    for (RepeatRule r : crit.rules) {
+        if (r.u == 1) fprintf(stderr, "  %d+ identical hex digits (%s, %s, ...)\n", r.n,
+                              std::string(r.n, '0').c_str(), std::string(r.n, 'A').c_str());
+        else {
+            std::string ex; for (int k = 0; k < r.n / 2; k++) ex += "AB";
+            fprintf(stderr, "  %d+ identical bytes (%s, ...)\n", r.n / 2, ex.c_str());
+        }
+    }
+    fprintf(stderr, "Estimated attempts: 2^%.1f\n", -log2(p_hit));
     fprintf(stderr, "Grid: %d blocks x %d threads, window %d => %llu candidates/launch\n",
             blocks, tpb, window, per_launch);
 
     // Device buffers.
-    uint8_t *d_base, *d_req, *d_mask, *d_scalar, *d_pub;
+    uint8_t *d_scalar, *d_pub;
     unsigned long long *d_count, *d_units;
-    cuda_check(cudaMalloc(&d_base, 32), "malloc base");
-    cuda_check(cudaMalloc(&d_req, prefix_len ? prefix_len : 1), "malloc req");
-    cuda_check(cudaMalloc(&d_mask, prefix_len ? prefix_len : 1), "malloc mask");
     cuda_check(cudaMalloc(&d_count, sizeof(unsigned long long)), "malloc count");
     cuda_check(cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP), "malloc units");
     cuda_check(cudaMalloc(&d_scalar, 32), "malloc scalar");
     cuda_check(cudaMalloc(&d_pub, 32), "malloc pub");
 
     // Shared precomputed step table i*D (affine x, y and x*y), i in [1,window/2].
+    // Allocated for the largest window, so a fallback to a smaller one can
+    // rebuild it in place.
     const size_t tbl = (size_t)(window / 2) + 1;
     bignum25519 *d_gx, *d_gy, *d_gp;
     cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * tbl), "malloc gx");
     cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * tbl), "malloc gy");
     cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * tbl), "malloc gp");
-    build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
-    cuda_check(cudaGetLastError(), "build_step_table launch");
-    cuda_check(cudaDeviceSynchronize(), "build_step_table sync");
-    cuda_check(cudaMemcpy(d_req, req.data(), prefix_len, cudaMemcpyHostToDevice), "memcpy req");
-    cuda_check(cudaMemcpy(d_mask, mask.data(), prefix_len, cudaMemcpyHostToDevice), "memcpy mask");
 
-    // Persistent per-thread window centre + the launch step point. Both depend
-    // on (blocks, tpb, window), so a window fallback invalidates them.
+    // The filter for this set of criteria. Each combination is its own kernel,
+    // so a mode never pays for checks it does not use.
+    DevList dlist(npfx > 1 || (nrule && npfx) ? crit.prefixes : std::vector<std::string>());
+    FilterOne f_one{0, 0};
+    if (npfx) pack_prefix(crit.prefixes[0], f_one.req8, f_one.mask8);
+    const FilterList f_list = dlist.filter();
+    FilterRepeat<1> f_r1 = nrule == 1 ? make_repeat<1>(crit.rules) : FilterRepeat<1>{};
+    FilterRepeat<2> f_r2 = nrule == 2 ? make_repeat<2>(crit.rules) : FilterRepeat<2>{};
+
+    // Per-thread state: the random base scalar, the launch it was drawn at,
+    // the carried centre point, and the "seed from base" flag.
+    std::vector<uint8_t> h_bases(threads * 32);
+    std::vector<unsigned long long> h_seeded(threads, 0);
+    uint8_t *d_bases, *d_fresh;
     bignum25519 *d_sx, *d_sy, *d_dstep;
+    cuda_check(cudaMalloc(&d_bases, threads * 32), "malloc bases");
+    cuda_check(cudaMalloc(&d_fresh, threads), "malloc fresh");
     cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * threads), "malloc state x");
     cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * threads), "malloc state y");
     cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "malloc dstep");
-    int have_state = 0;
-    auto rebuild_step = [&]() {
-        build_launch_step_kernel<<<1, 1>>>(d_dstep, per_launch);
-        cuda_check(cudaGetLastError(), "build_launch_step launch");
-        cuda_check(cudaDeviceSynchronize(), "build_launch_step sync");
-        have_state = 0;
-    };
-    rebuild_step();
 
-    // Random, once-only base counter (advanced deterministically per launch).
-    uint8_t base[32];
-    fill_random(base, 32);
-    clamp_scalar(base);
+    unsigned long long launch_no = 0;
+    // (Re)build everything that depends on the window, and give every thread a
+    // fresh random base.
+    auto setup_window = [&]() {
+        build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
+        cuda_check(cudaGetLastError(), "build_step_table launch");
+        build_launch_step_kernel<<<1, 1>>>(d_dstep, (unsigned long long)window);
+        cuda_check(cudaGetLastError(), "build_launch_step launch");
+        random_bases(h_bases.data(), threads);
+        std::fill(h_seeded.begin(), h_seeded.end(), launch_no);
+        cuda_check(cudaMemcpy(d_bases, h_bases.data(), threads * 32, cudaMemcpyHostToDevice),
+                   "memcpy bases");
+        cuda_check(cudaMemset(d_fresh, 1, threads), "memset fresh");
+        cuda_check(cudaDeviceSynchronize(), "setup sync");
+    };
+    setup_window();
+
+    const LaunchArgs la{d_bases, d_gx, d_gy, d_gp, d_count, d_units, d_dstep, d_sx, d_sy, d_fresh};
+    auto launch = [&]() -> cudaError_t {
+        if (nrule == 0)
+            return npfx == 1 ? launch_vanity(window, blocks, tpb, la, f_one)
+                             : launch_vanity(window, blocks, tpb, la, f_list);
+        if (nrule == 1)
+            return npfx == 0 ? launch_vanity(window, blocks, tpb, la, f_r1)
+                             : launch_vanity(window, blocks, tpb, la,
+                                             FilterEither<FilterRepeat<1>, FilterList>{f_r1, f_list});
+        return npfx == 0 ? launch_vanity(window, blocks, tpb, la, f_r2)
+                         : launch_vanity(window, blocks, tpb, la,
+                                         FilterEither<FilterRepeat<2>, FilterList>{f_r2, f_list});
+    };
 
     long found = 0;
     unsigned long long attempts = 0;
@@ -771,12 +1117,9 @@ int main(int argc, char **argv) {
     auto tlast = t0;
 
     while (true) {
-        cuda_check(cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice), "memcpy base");
         cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "memset count");
 
-        LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, prefix_len, d_count, d_units,
-                      d_dstep, d_sx, d_sy, have_state};
-        cudaError_t le = launch_vanity(window, blocks, tpb, la);
+        cudaError_t le = launch();
         if (le == cudaErrorMemoryAllocation) {
             // Auto-fall back to a smaller window (shrinks the per-thread local
             // frame) until it fits, so one binary works on any GPU.
@@ -787,11 +1130,9 @@ int main(int argc, char **argv) {
                 window = smaller;
                 per_launch = threads * (unsigned long long)window;
                 cudaGetLastError();  // clear
-                // The span per launch changed, so both the persistent centres
-                // and the step point are stale: rebuild and re-seed.
-                build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
-                cuda_check(cudaDeviceSynchronize(), "rebuild step table");
-                rebuild_step();
+                // The step per launch changed, so the carried centres and the
+                // step point are stale: rebuild and re-seed.
+                setup_window();
                 continue;
             }
             fprintf(stderr, "\nCUDA out of memory even at the smallest window (%d). "
@@ -800,35 +1141,59 @@ int main(int argc, char **argv) {
         }
         cuda_check(le, "kernel launch");
         cuda_check(cudaDeviceSynchronize(), "sync");
-        have_state = 1;      // the kernel just wrote each thread's next centre
 
         unsigned long long count = 0;
         cuda_check(cudaMemcpy(&count, d_count, sizeof(count), cudaMemcpyDeviceToHost), "copy count");
+        if (count > RESULT_CAP)
+            fprintf(stderr, "\nWarning: %llu matches in one launch, only %d recorded. "
+                            "Use a stricter criterion or fewer --blocks.\n",
+                    count, RESULT_CAP);
         unsigned long long n_units = count < RESULT_CAP ? count : RESULT_CAP;
         std::vector<unsigned long long> units(n_units);
         if (n_units)
             cuda_check(cudaMemcpy(units.data(), d_units,
                                   sizeof(unsigned long long) * n_units, cudaMemcpyDeviceToHost),
                        "copy units");
+        std::sort(units.begin(), units.end());       // groups hits by thread
 
-        for (unsigned long long k = 0; k < n_units; k++) {
+        // At most one key per thread per launch, and the thread gets a new
+        // random base right after: any two keys it produced from one base
+        // would differ by a known small multiple of 8, so leaking one private
+        // key would give away the other. Keys from different bases are
+        // independent. The discarded hits only matter for criteria so loose
+        // that one thread meets them several times in a single window.
+        std::vector<unsigned long long> reseed;
+        for (unsigned long long u : units) {
+            const unsigned long long g = u / window, j = u % window;
+            if (!reseed.empty() && reseed.back() == g) continue;
+
             uint8_t scalar[32];
-            scalar_add_u64(scalar, base, units[k] * 8ULL);
+            scalar_add_u64(scalar, &h_bases[g * 32],
+                           ((launch_no - h_seeded[g]) * window + j) * 8ULL);
             clamp_scalar(scalar);
 
-            uint8_t pub[32];
+            uint8_t pub[32], nib[64];
             pack_one(scalar, pub, d_scalar, d_pub);
+            key_nibbles(pub, nib);
 
-            // Host re-check of the full prefix (defensive; also validates GPU).
-            bool ok = true;
-            for (int i = 0; i < prefix_len; i++)
-                if ((pub[i] & mask[i]) != req[i]) { ok = false; break; }
-            if (!ok) continue;
+            // Host re-check against the full criteria (defensive; also
+            // validates the GPU, and tells us which criterion actually matched).
+            int which = match_nibbles(crit, nib, 64);
+            if (which < 0) continue;
+            reseed.push_back(g);
 
             uint8_t signing[32];
             fill_random(signing, 32);
             if (progress) fputc('\r', stderr);
             printf("\nFound matching key!\n");
+            if (which < npfx) {
+                if (npfx + nrule > 1) printf("Prefix:      %s\n", upper(crit.prefixes[which]).c_str());
+            } else {
+                RepeatRule r = crit.rules[which - npfx];
+                int run = periodic_len(nib, 64, r.u);
+                if (r.u == 1) printf("Repeat:      %d identical hex digits\n", run);
+                else          printf("Repeat:      %d identical bytes\n", run / 2);
+            }
             printf("Public Key:  %s\n", hex_upper(pub, 32).c_str());
             printf("Private Key: %s%s\n", hex_upper(scalar, 32).c_str(),
                    hex_upper(signing, 32).c_str());
@@ -838,8 +1203,30 @@ int main(int argc, char **argv) {
         }
 
         attempts += per_launch;
-        // Advance base by exactly the covered span => disjoint, no repeats.
-        scalar_add_u64(base, base, per_launch * 8ULL);
+        launch_no++;
+        if (!reseed.empty()) {
+            for (unsigned long long g : reseed) {
+                random_bases(&h_bases[g * 32], 1);
+                h_seeded[g] = launch_no;
+            }
+            if (reseed.size() <= 64) {
+                const uint8_t one = 1;
+                for (unsigned long long g : reseed) {
+                    cuda_check(cudaMemcpy(d_bases + g * 32, &h_bases[g * 32], 32,
+                                          cudaMemcpyHostToDevice), "memcpy base");
+                    cuda_check(cudaMemcpy(d_fresh + g, &one, 1, cudaMemcpyHostToDevice),
+                               "memcpy fresh");
+                }
+            } else {
+                // Every other thread's flag is already 0: the kernel clears it.
+                std::vector<uint8_t> fl(threads, 0);
+                for (unsigned long long g : reseed) fl[g] = 1;
+                cuda_check(cudaMemcpy(d_bases, h_bases.data(), threads * 32,
+                                      cudaMemcpyHostToDevice), "memcpy bases");
+                cuda_check(cudaMemcpy(d_fresh, fl.data(), threads, cudaMemcpyHostToDevice),
+                           "memcpy fresh");
+            }
+        }
 
         if (progress) {
             auto now = std::chrono::steady_clock::now();
@@ -851,11 +1238,11 @@ int main(int argc, char **argv) {
                                  attempts, mps);
                 if (found == 0 && n > 0 && n < (int)sizeof line) {
                     // Chance the span already searched contained a match. Each
-                    // candidate is a distinct scalar matching with p = 2^-bits,
-                    // so P = 1 - (1-p)^attempts. expm1/log1p keep that accurate
-                    // when p is tiny and the product would underflow a plain pow.
-                    double p = ldexp(1.0, -bits);
-                    double hit = -expm1((double)attempts * log1p(-p));
+                    // candidate is a distinct scalar meeting some criterion
+                    // with probability p_hit, so P = 1 - (1-p_hit)^attempts.
+                    // expm1 and log1p keep that accurate when p_hit is tiny and
+                    // the product would underflow a plain pow.
+                    double hit = -expm1((double)attempts * log1p(-p_hit));
                     snprintf(line + n, sizeof line - n,
                              ", %.3g%% chance it was already in range", hit * 100.0);
                 }
@@ -870,6 +1257,104 @@ done:
     fprintf(stderr, "\n");
     return 0;
 }
+
+// =========================================================================
+// Self-tests
+// =========================================================================
+
+// Each vanity_kernel<W> instantiation pins its own local-memory reserve for the
+// lifetime of the context, so running several in one context piles them up and
+// can exhaust a small or busy GPU. Give every kernel test a fresh context, the
+// same way bench_one does, and report a genuine shortage as a skip rather than
+// failing a correctness test for an environmental reason.
+static void fresh_context() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceReset();
+    cudaSetDevice(dev);
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+}
+
+// Everything one search-kernel configuration needs, for the tests and the
+// benchmark. Allocation failures clear `ok` instead of exiting.
+struct Rig {
+    int window, blocks, tpb;
+    unsigned long long thr;
+    uint8_t *d_bases = nullptr, *d_fresh = nullptr;
+    unsigned long long *d_count = nullptr, *d_units = nullptr;
+    bignum25519 *d_gx = nullptr, *d_gy = nullptr, *d_gp = nullptr;
+    bignum25519 *d_sx = nullptr, *d_sy = nullptr, *d_dstep = nullptr;
+    std::vector<uint8_t> bases;          // per-thread base scalars (host copy)
+    bool ok = true;                      // allocations and precompute succeeded
+    bool oom = false;                    // a launch ran out of memory
+    unsigned long long last_count = 0;   // raw hit count of the last run
+
+    Rig(int w, int b, int t) : window(w), blocks(b), tpb(t), thr((unsigned long long)b * t) {
+        auto m = [&](void *p, size_t n) {
+            if (ok && cudaMalloc((void **)p, n) != cudaSuccess) { cudaGetLastError(); ok = false; }
+        };
+        const size_t tbl = sizeof(bignum25519) * (w / 2 + 1);
+        m(&d_bases, thr * 32); m(&d_fresh, thr);
+        m(&d_count, sizeof(unsigned long long));
+        m(&d_units, sizeof(unsigned long long) * RESULT_CAP);
+        m(&d_gx, tbl); m(&d_gy, tbl); m(&d_gp, tbl);
+        m(&d_sx, sizeof(bignum25519) * thr); m(&d_sy, sizeof(bignum25519) * thr);
+        m(&d_dstep, sizeof(bignum25519) * 3);
+        bases.resize(thr * 32);
+        random_bases(bases.data(), thr);
+        if (!ok) return;
+        build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, w);
+        build_launch_step_kernel<<<1, 1>>>(d_dstep, (unsigned long long)w);
+        if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); ok = false; return; }
+        upload();
+    }
+    ~Rig() {
+        cudaFree(d_bases); cudaFree(d_fresh); cudaFree(d_count); cudaFree(d_units);
+        cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
+        cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_dstep);
+    }
+    Rig(const Rig &) = delete;
+    Rig &operator=(const Rig &) = delete;
+
+    // Copy `bases` to the device.
+    void upload() {
+        cudaMemcpy(d_bases, bases.data(), thr * 32, cudaMemcpyHostToDevice);
+    }
+
+    template <class F>
+    cudaError_t launch(const F &f) {
+        cudaMemset(d_count, 0, sizeof(unsigned long long));
+        LaunchArgs la{d_bases, d_gx, d_gy, d_gp, d_count, d_units, d_dstep, d_sx, d_sy, d_fresh};
+        return launch_vanity(window, blocks, tpb, la, f);
+    }
+
+    // One launch; returns the sorted recorded units. reseed = start every
+    // thread from its base (otherwise continue from the carried centres).
+    template <class F>
+    std::vector<unsigned long long> run(const F &f, bool reseed = true) {
+        std::vector<unsigned long long> v;
+        if (!ok || oom) return v;
+        if (reseed) cudaMemset(d_fresh, 1, thr);
+        cudaError_t le = launch(f);
+        if (le == cudaErrorMemoryAllocation) { cudaGetLastError(); oom = true; return v; }
+        cuda_check(le, "test launch");
+        cuda_check(cudaDeviceSynchronize(), "test sync");
+        cuda_check(cudaMemcpy(&last_count, d_count, sizeof(last_count), cudaMemcpyDeviceToHost),
+                   "test count");
+        v.resize(last_count < RESULT_CAP ? last_count : RESULT_CAP);
+        if (!v.empty())
+            cuda_check(cudaMemcpy(v.data(), d_units, sizeof(unsigned long long) * v.size(),
+                                  cudaMemcpyDeviceToHost), "test units");
+        std::sort(v.begin(), v.end());
+        return v;
+    }
+
+    bool skipped(const char *what) const {
+        if (ok && !oom) return false;
+        printf("[selftest] window %5d %s: skipped (not enough free VRAM)\n", window, what);
+        return true;
+    }
+};
 
 // -------------------------------------------------------------------------
 // Self-test: the fast low-64-bit packing must agree with donna's full contract
@@ -926,162 +1411,203 @@ static int check_contract_lo64() {
 }
 
 // -------------------------------------------------------------------------
-// Self-test: window coverage. Run the real search kernel with prefix_len = 0,
+// Self-test: window coverage. Run the real search kernel with an empty filter,
 // so every candidate "matches" and out_units becomes the exact set of units the
 // window walked. It must be precisely [0, blocks*tpb*W) — no gap, no repeat, no
 // overrun into the neighbouring thread's span. This is what guards the +/-i
 // walk, whose failure mode is silently losing or duplicating candidates rather
 // than producing wrong keys.
 // -------------------------------------------------------------------------
-// Each vanity_kernel<W> instantiation pins its own local-memory reserve for the
-// lifetime of the context, so running several in one context piles them up and
-// can exhaust a small or busy GPU. Give every window test a fresh context, the
-// same way bench_one does, and report a genuine shortage as a skip rather than
-// failing a correctness test for an environmental reason.
-static void fresh_context() {
-    int dev = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceReset();
-    cudaSetDevice(dev);
-    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-}
-
 static int check_window_coverage(int window, int blocks, int tpb) {
     const unsigned long long expect = (unsigned long long)blocks * tpb * window;
     if (expect > RESULT_CAP) { printf("[selftest] coverage W=%d skipped (too many units)\n", window); return 0; }
     fresh_context();
+    Rig r(window, blocks, tpb);
+    std::vector<unsigned long long> units = r.run(FilterOne{0, 0});
+    if (r.skipped("coverage")) return 0;
 
-    uint8_t base[32]; fill_random(base, 32); clamp_scalar(base);
-    uint8_t *d_base, *d_req;
-    unsigned long long *d_count, *d_units;
-    bignum25519 *d_gx, *d_gy, *d_gp, *d_sx, *d_sy, *d_dstep;
-    const size_t tbl = (size_t)(window / 2) + 1;
-    const unsigned long long thr = (unsigned long long)blocks * tpb;
-    cuda_check(cudaMalloc(&d_base, 32), "cov malloc base");
-    cuda_check(cudaMalloc(&d_req, 1), "cov malloc req");
-    cuda_check(cudaMalloc(&d_count, sizeof(unsigned long long)), "cov malloc count");
-    cuda_check(cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP), "cov malloc units");
-    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * tbl), "cov malloc gx");
-    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * tbl), "cov malloc gy");
-    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * tbl), "cov malloc gp");
-    cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * thr), "cov malloc sx");
-    cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * thr), "cov malloc sy");
-    cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "cov malloc dstep");
-    cuda_check(cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice), "cov memcpy base");
-    cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "cov memset");
-    build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
-    build_launch_step_kernel<<<1, 1>>>(d_dstep, thr * (unsigned long long)window);
-    cuda_check(cudaDeviceSynchronize(), "cov table");
-
-    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_req, 0, d_count, d_units,
-                  d_dstep, d_sx, d_sy, 0};
-    cudaError_t le = launch_vanity(window, blocks, tpb, la);
-    if (le == cudaErrorMemoryAllocation) {
-        cudaGetLastError();
-        printf("[selftest] window %5d coverage: skipped (not enough free VRAM)\n", window);
-        return 0;
-    }
-    cuda_check(le, "cov launch");
-    cuda_check(cudaDeviceSynchronize(), "cov sync");
-
-    unsigned long long count = 0;
-    cuda_check(cudaMemcpy(&count, d_count, sizeof(count), cudaMemcpyDeviceToHost), "cov count");
-    std::vector<unsigned long long> units(count < RESULT_CAP ? count : RESULT_CAP);
-    if (!units.empty())
-        cuda_check(cudaMemcpy(units.data(), d_units, sizeof(unsigned long long) * units.size(),
-                              cudaMemcpyDeviceToHost), "cov units");
-    cudaFree(d_base); cudaFree(d_req); cudaFree(d_count); cudaFree(d_units);
-    cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
-    cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_dstep);
-
-    std::sort(units.begin(), units.end());
-    bool ok = (count == expect) && (units.size() == expect);
+    bool ok = (r.last_count == expect) && (units.size() == expect);
     for (unsigned long long i = 0; ok && i < expect; i++) if (units[i] != i) ok = false;
     printf("[selftest] window %5d coverage (%d x %d threads): %s (%llu/%llu units)\n",
-           window, blocks, tpb, ok ? "exact" : "BROKEN", count, expect);
+           window, blocks, tpb, ok ? "exact" : "BROKEN", r.last_count, expect);
     return ok ? 0 : 1;
 }
 
 // -------------------------------------------------------------------------
-// Self-test: the persistent walk. Between launches a thread no longer rebuilds
-// its window centre from `base`; it advances the point it kept by D = span*B.
+// Self-test: the persistent walk. Between launches a thread does not rebuild
+// its window centre from its base; it advances the point it kept by D = W*8*B.
 // If that drifts, the search silently scans the wrong scalars — nothing else
 // would catch it, because the recorded units stay in range either way.
 //
-// So: run the kernel at base2 from a cold seed, and separately run it at base
-// and then at base2 off the carried-over state. With a real (1-byte) prefix the
-// recorded set depends on the actual points, and the two must agree exactly.
+// So: run the kernel with every base moved on by one window from a cold seed,
+// and separately run it at the original bases and then once more off the
+// carried-over state. With a real (1-byte) prefix the recorded set depends on
+// the actual points, and the two must agree exactly.
 // -------------------------------------------------------------------------
 static int check_persistent_walk(int window, int blocks, int tpb) {
     fresh_context();
-    const unsigned long long thr = (unsigned long long)blocks * tpb;
-    const unsigned long long span = thr * (unsigned long long)window;
+    Rig r(window, blocks, tpb);
+    const FilterOne f{0x00, 0xFF};                 // one byte: ~1 hit in 256 candidates
 
-    uint8_t base1[32], base2[32];
-    fill_random(base1, 32); clamp_scalar(base1);
-    scalar_add_u64(base2, base1, span * 8ULL); clamp_scalar(base2);
-
-    const int PL = 1;
-    const uint8_t req = 0x00, msk = 0xFF;      // ~1 hit in 256 candidates
-
-    uint8_t *d_base, *d_req, *d_mask;
-    unsigned long long *d_count, *d_units;
-    bignum25519 *d_gx, *d_gy, *d_gp, *d_sx, *d_sy, *d_dstep;
-    cuda_check(cudaMalloc(&d_base, 32), "pw base");
-    cuda_check(cudaMalloc(&d_req, 1), "pw req");
-    cuda_check(cudaMalloc(&d_mask, 1), "pw mask");
-    cuda_check(cudaMalloc(&d_count, sizeof(unsigned long long)), "pw count");
-    cuda_check(cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP), "pw units");
-    cuda_check(cudaMalloc(&d_gx, sizeof(bignum25519) * (window / 2 + 1)), "pw gx");
-    cuda_check(cudaMalloc(&d_gy, sizeof(bignum25519) * (window / 2 + 1)), "pw gy");
-    cuda_check(cudaMalloc(&d_gp, sizeof(bignum25519) * (window / 2 + 1)), "pw gp");
-    cuda_check(cudaMalloc(&d_sx, sizeof(bignum25519) * thr), "pw sx");
-    cuda_check(cudaMalloc(&d_sy, sizeof(bignum25519) * thr), "pw sy");
-    cuda_check(cudaMalloc(&d_dstep, sizeof(bignum25519) * 3), "pw dstep");
-    cuda_check(cudaMemcpy(d_req, &req, 1, cudaMemcpyHostToDevice), "pw cp req");
-    cuda_check(cudaMemcpy(d_mask, &msk, 1, cudaMemcpyHostToDevice), "pw cp mask");
-    build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, window);
-    build_launch_step_kernel<<<1, 1>>>(d_dstep, span);
-    cuda_check(cudaDeviceSynchronize(), "pw precompute");
-
-    bool oom = false;
-    auto go = [&](const uint8_t *b, int have_state) {
-        std::vector<unsigned long long> empty;
-        if (oom) return empty;
-        cuda_check(cudaMemcpy(d_base, b, 32, cudaMemcpyHostToDevice), "pw cp base");
-        cuda_check(cudaMemset(d_count, 0, sizeof(unsigned long long)), "pw memset");
-        LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, PL, d_count, d_units,
-                      d_dstep, d_sx, d_sy, have_state};
-        cudaError_t le = launch_vanity(window, blocks, tpb, la);
-        if (le == cudaErrorMemoryAllocation) { cudaGetLastError(); oom = true; return empty; }
-        cuda_check(le, "pw launch");
-        cuda_check(cudaDeviceSynchronize(), "pw sync");
-        unsigned long long n = 0;
-        cuda_check(cudaMemcpy(&n, d_count, sizeof(n), cudaMemcpyDeviceToHost), "pw count");
-        if (n > RESULT_CAP) n = RESULT_CAP;
-        std::vector<unsigned long long> v(n);
-        if (n) cuda_check(cudaMemcpy(v.data(), d_units, sizeof(unsigned long long) * n,
-                                     cudaMemcpyDeviceToHost), "pw units");
-        std::sort(v.begin(), v.end());
-        return v;
-    };
-
-    std::vector<unsigned long long> cold = go(base2, 0);   // seeded straight at base2
-    (void)go(base1, 0);                                    // seed at base1, carry state
-    std::vector<unsigned long long> warm = go(base2, 1);   // must land on base2 by walking
-
-    cudaFree(d_base); cudaFree(d_req); cudaFree(d_mask); cudaFree(d_count); cudaFree(d_units);
-    cudaFree(d_gx); cudaFree(d_gy); cudaFree(d_gp);
-    cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_dstep);
-
-    if (oom) {
-        printf("[selftest] window %5d persistent walk: skipped (not enough free VRAM)\n", window);
-        return 0;
+    std::vector<uint8_t> base1 = r.bases, base2(base1.size());
+    for (unsigned long long g = 0; g < r.thr; g++) {
+        scalar_add_u64(&base2[g * 32], &base1[g * 32], (unsigned long long)window * 8ULL);
+        clamp_scalar(&base2[g * 32]);
     }
+
+    r.bases = base2; r.upload();
+    std::vector<unsigned long long> cold = r.run(f);           // seeded straight at base2
+    r.bases = base1; r.upload();
+    (void)r.run(f);                                            // seed at base1, carry state
+    std::vector<unsigned long long> warm = r.run(f, false);    // must land on base2 by walking
+    if (r.skipped("persistent walk")) return 0;
+
     bool ok = !cold.empty() && cold == warm;
     printf("[selftest] window %5d persistent walk == cold seed: %s (%zu vs %zu hits)\n",
            window, ok ? "identical" : "BROKEN", cold.size(), warm.size());
     return ok ? 0 : 1;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: a filter against a plain prefix list that means the same thing.
+// Both kernels run over the same bases and grid, so the recorded sets must be
+// identical: nothing missed, nothing invented.
+// -------------------------------------------------------------------------
+// `make_filter(extra)` builds the filter under test; `extra` is `extra_prefixes`
+// already in device memory, created after the context reset like everything
+// else here.
+template <class MakeFilter>
+static int check_filter_vs_list(const char *name, int window, int blocks, int tpb,
+                                const std::vector<std::string> &extra_prefixes,
+                                MakeFilter make_filter, const std::vector<std::string> &equiv) {
+    fresh_context();
+    Rig r(window, blocks, tpb);
+    std::vector<unsigned long long> got, want;
+    {
+        DevList extra(extra_prefixes), dl(equiv);
+        got = r.run(make_filter(extra));
+        want = r.run(dl.filter());
+    }
+    if (r.skipped(name)) return 0;
+    bool ok = !want.empty() && got == want;
+    printf("[selftest] window %5d %s: %s (%zu vs %zu hits)\n",
+           window, name, ok ? "identical" : "BROKEN", got.size(), want.size());
+    return ok ? 0 : 1;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: the prefix-list kernel. Searching a list must find exactly the
+// union of what the single-prefix kernel finds for each entry separately.
+// -------------------------------------------------------------------------
+static int check_prefix_list(int window, int blocks, int tpb) {
+    fresh_context();
+    Rig r(window, blocks, tpb);
+    // Deliberately mixed lengths (2, 1 and 4 digits) so the masks differ too —
+    // with uniform masks a filter that ignored the per-entry mask would still
+    // pass. The short one dominates the hit rate and keeps the sample healthy.
+    const std::vector<std::string> entries = {"37", "c", "abcd"};
+
+    std::vector<unsigned long long> list, uni;
+    {
+        DevList dl(entries);
+        list = r.run(dl.filter());
+    }
+    for (const std::string &e : entries) {
+        FilterOne f; pack_prefix(e, f.req8, f.mask8);
+        std::vector<unsigned long long> one = r.run(f);
+        uni.insert(uni.end(), one.begin(), one.end());
+    }
+    std::sort(uni.begin(), uni.end());
+    uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
+    if (r.skipped("prefix list")) return 0;
+
+    bool ok = !uni.empty() && list == uni;
+    printf("[selftest] window %5d list of %zu == union of single runs: %s (%zu vs %zu hits)\n",
+           window, entries.size(), ok ? "identical" : "BROKEN", list.size(), uni.size());
+    return ok ? 0 : 1;
+}
+
+// Every key a repeat rule accepts, as explicit prefixes.
+static std::vector<std::string> expand_rule(RepeatRule r) {
+    static const char *H = "0123456789abcdef";
+    std::vector<std::string> out;
+    const int units = r.u == 1 ? 16 : 256;
+    for (int v = 0; v < units; v++) {
+        std::string unit = r.u == 1 ? std::string(1, H[v]) : std::string{H[v >> 4], H[v & 15]};
+        std::string s;
+        while ((int)s.size() < r.n) s += unit;
+        out.push_back(s.substr(0, r.n));
+    }
+    return out;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: the repeat filters, alone and combined with a prefix list,
+// against the equivalent explicit list (itself checked by check_prefix_list).
+// The nibble rule uses an odd length on purpose: its last digit is a high
+// nibble, the case where the digits are not contiguous in the low word.
+// -------------------------------------------------------------------------
+static int check_repeat(int window, int blocks, int tpb) {
+    int fails = 0;
+    const std::vector<RepeatRule> nib = {{3, 1}}, both = {{3, 1}, {4, 2}};
+    const std::vector<std::string> extra = {"37", "c0d"};
+
+    fails += check_filter_vs_list("repeat-nibble 3 == its 16 prefixes", window, blocks, tpb, {},
+                                  [&](const DevList &) { return make_repeat<1>(nib); },
+                                  expand_rule(nib[0]));
+
+    std::vector<std::string> equiv = expand_rule(both[0]);
+    for (const std::string &s : expand_rule(both[1])) equiv.push_back(s);
+    for (const std::string &s : extra) equiv.push_back(s);
+    fails += check_filter_vs_list("repeats + list == their 274 prefixes", window, blocks, tpb, extra,
+                                  [&](const DevList &dl) {
+                                      return FilterEither<FilterRepeat<2>, FilterList>{
+                                          make_repeat<2>(both), dl.filter()};
+                                  },
+                                  equiv);
+    return fails;
+}
+
+// -------------------------------------------------------------------------
+// Self-test: normalize() and hit_probability() against brute force. Every key
+// of 5 hex digits is enumerated and checked against the raw criteria; the
+// matching fraction must equal the computed probability exactly, which checks
+// the overlap arithmetic and that dropping redundant criteria changes nothing.
+// The host-side matcher used for real hits is the one enumerated here.
+// -------------------------------------------------------------------------
+static int check_probability() {
+    struct Case { std::vector<std::string> p; std::vector<RepeatRule> r; };
+    const Case cases[] = {
+        {{"a", "ab", "37", "37"}, {}},
+        {{"aa", "aab", "5", "12", "666"}, {{3, 1}}},
+        {{"a", "0a0", "77", "2", "5555"}, {{3, 1}, {4, 2}}},
+        {{"3434", "343", "1"}, {{5, 1}, {4, 2}}},
+        {{"ab", "abab"}, {{4, 2}}},
+    };
+    const int D = 5, N = 1 << (4 * D);
+    int fails = 0, idx = 0;
+    for (const Case &cs : cases) {
+        Criteria raw{cs.p, cs.r}, norm = raw;
+        normalize(norm, false);
+        long hits = 0, hits_norm = 0;
+        uint8_t nib[D];
+        for (int x = 0; x < N; x++) {
+            for (int i = 0; i < D; i++) nib[i] = (x >> (4 * (D - 1 - i))) & 0xF;
+            hits += match_nibbles(raw, nib, D) >= 0;
+            hits_norm += match_nibbles(norm, nib, D) >= 0;
+        }
+        const double exact = (double)hits / N, calc = hit_probability(norm);
+        const bool ok = hits == hits_norm && fabs(exact - calc) <= 1e-12 * exact;
+        if (!ok) {
+            printf("[selftest] probability case %d: BROKEN (brute %ld/%d, normalized %ld, "
+                   "formula %.10g)\n", idx, hits, N, hits_norm, calc * N);
+            fails++;
+        }
+        idx++;
+    }
+    printf("[selftest] hit probability == brute force over 16^%d keys: %s (%d cases)\n",
+           D, fails ? "BROKEN" : "exact", idx);
+    return fails;
 }
 
 // -------------------------------------------------------------------------
@@ -1090,8 +1616,7 @@ static int check_persistent_walk(int window, int blocks, int tpb) {
 static int run_selftest() {
     const int N = 512;
     std::vector<uint8_t> scalars(N * 32);
-    fill_random(scalars.data(), N * 32);
-    for (int i = 0; i < N; i++) clamp_scalar(scalars.data() + i * 32);
+    random_bases(scalars.data(), N);
 
     // Force scalars[0] to a fixed known-answer input for KAT comparison.
     uint8_t kat_scalar[32];
@@ -1119,11 +1644,18 @@ static int run_selftest() {
     for (int i = 0; i < N; i++) if (!ok[i]) fails++;
     printf("[selftest] incremental identity (s+8)*B == s*B + 8B: %d/%d ok\n", N - fails, N);
 
-    printf("[selftest] KAT scalar    = %s\n", hex_upper(kat_scalar, 32).c_str());
-    printf("[selftest] KAT pubkey    = %s\n", hex_upper(pub0, 32).c_str());
-    printf("[selftest] (compare against reference scalar*B; see README)\n");
+    // crypto_scalarmult_ed25519_base_noclamp(kat_scalar) from libsodium/PyNaCl.
+    const std::string kat_want =
+        "CFE058A4A189EE7230E43A1347EA1A7EEF01F3557991A7FD3CEC8915FD290AEC";
+    const std::string kat_got = hex_upper(pub0, 32);
+    const bool kat_ok = kat_got == kat_want;
+    printf("[selftest] KAT scalar*B == libsodium: %s\n", kat_ok ? "ok" : "BROKEN");
+    if (!kat_ok) printf("[selftest]   got  %s\n[selftest]   want %s\n",
+                        kat_got.c_str(), kat_want.c_str());
+    fails += !kat_ok;
 
     fails += check_contract_lo64();
+    fails += check_probability();
     // A power-of-two window, a "half" window, and >1 thread so the boundary
     // between neighbouring spans is actually exercised.
     fails += check_window_coverage(64, 2, 2);
@@ -1131,7 +1663,12 @@ static int run_selftest() {
     fails += check_window_coverage(1536, 1, 2);
     fails += check_persistent_walk(256, 8, 64);
     fails += check_persistent_walk(1536, 4, 32);
+    fails += check_prefix_list(256, 8, 64);
+    fails += check_prefix_list(1536, 4, 32);
+    fails += check_repeat(256, 8, 64);
+    fails += check_repeat(1536, 4, 32);
 
+    printf("[selftest] %s\n", fails ? "FAILED" : "all passed");
     return fails == 0 ? 0 : 2;
 }
 
@@ -1150,53 +1687,22 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
     cudaSetDevice(dev);
     cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
 
-    const int PL = 8;                              // never-matching prefix
-    std::vector<uint8_t> req(PL, 0), mask(PL, 0xFF);
-    uint8_t base[32];
-    fill_random(base, 32);
-    clamp_scalar(base);
-
-    uint8_t *d_base, *d_req, *d_mask;
-    unsigned long long *d_count, *d_units;
-    bignum25519 *d_gx, *d_gy, *d_gp, *d_sx, *d_sy, *d_dstep;
-    const unsigned long long thr = (unsigned long long)blocks * tpb;
-    bool ok =
-        cudaMalloc(&d_base, 32) == cudaSuccess &&
-        cudaMalloc(&d_req, PL) == cudaSuccess &&
-        cudaMalloc(&d_mask, PL) == cudaSuccess &&
-        cudaMalloc(&d_count, sizeof(unsigned long long)) == cudaSuccess &&
-        cudaMalloc(&d_units, sizeof(unsigned long long) * RESULT_CAP) == cudaSuccess &&
-        cudaMalloc(&d_gx, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
-        cudaMalloc(&d_gy, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
-        cudaMalloc(&d_gp, sizeof(bignum25519) * (w / 2 + 1)) == cudaSuccess &&
-        cudaMalloc(&d_sx, sizeof(bignum25519) * thr) == cudaSuccess &&
-        cudaMalloc(&d_sy, sizeof(bignum25519) * thr) == cudaSuccess &&
-        cudaMalloc(&d_dstep, sizeof(bignum25519) * 3) == cudaSuccess;
-    if (ok) {
-        cudaMemcpy(d_base, base, 32, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_req, req.data(), PL, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_mask, mask.data(), PL, cudaMemcpyHostToDevice);
-        cudaMemset(d_count, 0, sizeof(unsigned long long));
-        build_step_table_kernel<<<1, 1>>>(d_gx, d_gy, d_gp, w);
-        build_launch_step_kernel<<<1, 1>>>(d_dstep, thr * (unsigned long long)w);
-        if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); ok = false; }
-    }
-    if (!ok) return -1;
-
-    LaunchArgs la{d_base, d_gx, d_gy, d_gp, d_req, d_mask, PL, d_count, d_units,
-                  d_dstep, d_sx, d_sy, 0};
-    unsigned long long per_launch = thr * (unsigned long long)w;
+    Rig r(w, blocks, tpb);
+    if (!r.ok) return -1;
+    cudaMemset(r.d_fresh, 1, r.thr);
+    const FilterOne f{0, ~0ULL};             // 8 bytes of zeros: never matches
+    const unsigned long long per_launch = r.thr * (unsigned long long)w;
 
     // Launches until >= target seconds elapse; returns elapsed (or -1 on error)
-    // with the candidate count via out-param.
+    // with the candidate count via out-param. Only the very first launch pays
+    // for the seed: the kernel clears each thread's flag.
     auto run_span = [&](double target, unsigned long long &cand) -> double {
         cand = 0;
         auto t0 = clock::now();
         double el = 0;
         do {
-            if (launch_vanity(w, blocks, tpb, la) != cudaSuccess) { cudaGetLastError(); return -1; }
+            if (r.launch(f) != cudaSuccess) { cudaGetLastError(); return -1; }
             if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return -1; }
-            la.have_state = 1;      // only the first launch pays for the seed
             cand += per_launch;
             el = std::chrono::duration<double>(clock::now() - t0).count();
         } while (el < target);
@@ -1212,8 +1718,8 @@ static double bench_one(int w, int blocks, int tpb, int dev) {
 
 // -------------------------------------------------------------------------
 // Quick benchmark: sweep every window at the base block size, then sweep the
-// block size (tpb) at the fastest window, and report the best (window, tpb).
-// ~1s warm-up + ~1s measured per point.
+// block size (tpb) over the two fastest windows, and report the best
+// (window, tpb). ~1s warm-up + ~1s measured per point.
 // -------------------------------------------------------------------------
 static int run_benchmark(int blocks, int tpb) {
     int numSM = 1, maxThreadsSM = 1, dev = 0;
