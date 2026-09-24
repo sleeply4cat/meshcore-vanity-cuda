@@ -184,6 +184,133 @@ __device__ __forceinline__ static uint64_t key_lo64(const bignum25519 y) {
 }
 
 // -------------------------------------------------------------------------
+// key_lo64(a*b) without the middle of the multiply.
+//
+// The filter reads only the low 64 bits of the final product y = a*b, and
+// those depend on just a few of the ten product columns. Write the product
+// columns (before any carry) as m0..m9 at bit offsets 0,26,51,77,...,230 and
+// S = sum m_k 2^off_k. curve25519_mul's carry chain computes exactly
+// S mod 2^255 plus 19*Q folded into limb 0, Q = floor(S / 2^255), so
+//     key_lo64(a*b) = (m0 + m1 2^26 + m2 2^51 + 19 Q)  mod 2^64
+// (m3 starts at bit 77). Q depends on the top: in units of 2^179, the columns
+// below m7 add less than 2^37 to m9 2^51 + m8 2^25 + m7 (for the operand
+// ranges below), so the nested floor over m7..m9 gives Q exactly unless that
+// sum is within 2^38 below a multiple of 2^76. So 6 of the 10 columns are
+// enough: 60 of the 100 partial products, and 3 carry steps instead of 11.
+//
+// Returns lo, and alt = true in the ~2^-38 case where Q may be one larger
+// (then the true value is lo or lo + 19 and the caller tests both; the host
+// re-derives every hit, so an extra candidate costs nothing but a check).
+// Otherwise the result is bit-identical to key_lo64(curve25519_mul(a, b)),
+// documented 2^-203 miss included. --selftest checks this on edge values and
+// on random products with the search kernel's operand ranges.
+//
+// Operand ranges are those of curve25519_mul in the search kernel: b is the
+// one scaled by 19/38, so it must be a multiply output (limbs within their 26/25
+// bits, limb 1 a little over); a may be an unreduced curve25519_add or a
+// partially carried curve25519_sub of multiply outputs (limbs up to ~1.5 * 2^27).
+// -------------------------------------------------------------------------
+__device__ __forceinline__ static uint64_t mul_key_lo64(const bignum25519 a, const bignum25519 b,
+                                                        bool &alt) {
+    const uint32_t s0 = a[0], s1 = a[1], s2 = a[2], s3 = a[3], s4 = a[4],
+                   s5 = a[5], s6 = a[6], s7 = a[7], s8 = a[8], s9 = a[9];
+    const uint32_t r0 = b[0], r1 = b[1], r2 = b[2], r3 = b[3], r4 = b[4],
+                   r5 = b[5], r6 = b[6], r7 = b[7], r8 = b[8], r9 = b[9];
+    // Wrapped terms (i + j >= 10) carry 19; both-odd terms carry an extra 2.
+    const uint32_t r2_19 = r2 * 19, r4_19 = r4 * 19, r6_19 = r6 * 19, r8_19 = r8 * 19;
+    const uint32_t r3_19 = r3 * 19, r5_19 = r5 * 19, r7_19 = r7 * 19, r9_19 = r9 * 19;
+    const uint32_t r1_38 = r1 * 38, r3_38 = r3 * 38, r5_38 = r5 * 38, r7_38 = r7 * 38,
+                   r9_38 = r9 * 38;
+    const uint32_t r1_2 = r1 * 2, r3_2 = r3 * 2, r5_2 = r5 * 2, r7_2 = r7 * 2;
+    uint32_t l0, h0, l1, h1, l2, h2, l7, h7, l8, h8, l9, h9;
+
+    MUL64_SET(l0, h0, s0, r0);
+    MUL64_ACC(l0, h0, s1, r9_38); MUL64_ACC(l0, h0, s2, r8_19); MUL64_ACC(l0, h0, s3, r7_38);
+    MUL64_ACC(l0, h0, s4, r6_19); MUL64_ACC(l0, h0, s5, r5_38); MUL64_ACC(l0, h0, s6, r4_19);
+    MUL64_ACC(l0, h0, s7, r3_38); MUL64_ACC(l0, h0, s8, r2_19); MUL64_ACC(l0, h0, s9, r1_38);
+
+    MUL64_SET(l1, h1, s0, r1);    MUL64_ACC(l1, h1, s1, r0);
+    MUL64_ACC(l1, h1, s2, r9_19); MUL64_ACC(l1, h1, s3, r8_19); MUL64_ACC(l1, h1, s4, r7_19);
+    MUL64_ACC(l1, h1, s5, r6_19); MUL64_ACC(l1, h1, s6, r5_19); MUL64_ACC(l1, h1, s7, r4_19);
+    MUL64_ACC(l1, h1, s8, r3_19); MUL64_ACC(l1, h1, s9, r2_19);
+
+    MUL64_SET(l2, h2, s0, r2);    MUL64_ACC(l2, h2, s1, r1_2);  MUL64_ACC(l2, h2, s2, r0);
+    MUL64_ACC(l2, h2, s3, r9_38); MUL64_ACC(l2, h2, s4, r8_19); MUL64_ACC(l2, h2, s5, r7_38);
+    MUL64_ACC(l2, h2, s6, r6_19); MUL64_ACC(l2, h2, s7, r5_38); MUL64_ACC(l2, h2, s8, r4_19);
+    MUL64_ACC(l2, h2, s9, r3_38);
+
+    MUL64_SET(l7, h7, s0, r7);    MUL64_ACC(l7, h7, s1, r6);    MUL64_ACC(l7, h7, s2, r5);
+    MUL64_ACC(l7, h7, s3, r4);    MUL64_ACC(l7, h7, s4, r3);    MUL64_ACC(l7, h7, s5, r2);
+    MUL64_ACC(l7, h7, s6, r1);    MUL64_ACC(l7, h7, s7, r0);
+    MUL64_ACC(l7, h7, s8, r9_19); MUL64_ACC(l7, h7, s9, r8_19);
+
+    MUL64_SET(l8, h8, s0, r8);    MUL64_ACC(l8, h8, s1, r7_2);  MUL64_ACC(l8, h8, s2, r6);
+    MUL64_ACC(l8, h8, s3, r5_2);  MUL64_ACC(l8, h8, s4, r4);    MUL64_ACC(l8, h8, s5, r3_2);
+    MUL64_ACC(l8, h8, s6, r2);    MUL64_ACC(l8, h8, s7, r1_2);  MUL64_ACC(l8, h8, s8, r0);
+    MUL64_ACC(l8, h8, s9, r9_38);
+
+    MUL64_SET(l9, h9, s0, r9);    MUL64_ACC(l9, h9, s1, r8);    MUL64_ACC(l9, h9, s2, r7);
+    MUL64_ACC(l9, h9, s3, r6);    MUL64_ACC(l9, h9, s4, r5);    MUL64_ACC(l9, h9, s5, r4);
+    MUL64_ACC(l9, h9, s6, r3);    MUL64_ACC(l9, h9, s7, r2);    MUL64_ACC(l9, h9, s8, r1);
+    MUL64_ACC(l9, h9, s9, r0);
+
+    // Q = floor((m9 2^51 + m8 2^25 + m7) / 2^76), as nested floors.
+    const uint64_t u8 = MUL64_GET(l8, h8) + (MUL64_GET(l7, h7) >> 25);
+    const uint64_t u9 = MUL64_GET(l9, h9) + (u8 >> 26);
+    const uint64_t q  = u9 >> 25;
+    // Dropped fraction f9 2^51 + f8 2^25 + f7 can only come within 2^38 of
+    // 2^76 if f9 is all ones and f8 is within 2^13 of all ones.
+    alt = ((uint32_t)u9 & 0x1FFFFFFu) == 0x1FFFFFFu &&
+          ((uint32_t)u8 & 0x3FFFFFFu) >= 0x3FFFFFFu - 0x2000u;
+    return MUL64_GET(l0, h0) + (MUL64_GET(l1, h1) << 26) + (MUL64_GET(l2, h2) << 51) + 19 * q;
+}
+
+// -------------------------------------------------------------------------
+// Stage 1 of the filter: the low 26 bits of key_lo64(a*b), from 30 of the 100
+// partial products. Those bits are (m0 + 19 Q) mod 2^26 (m1 starts at bit 26),
+// and here Q comes from the top two columns alone: everything from m7 down
+// adds less than 2^60 to m9 2^51 + m8 2^25 (in units of 2^179), so the floor is
+// exact unless that sum's fraction below 2^76 is within 2^64 of the next
+// multiple — flagged as alt (~2^-12), where Q may be one larger and both
+// values are tested. A criterion of 7+ hex digits rejects all but ~2^-24 of
+// the candidates on these bits; the few that pass get the full 64 bits.
+// Operand ranges as mul_key_lo64.
+// -------------------------------------------------------------------------
+__device__ __forceinline__ static uint32_t mul_key_lo26(const bignum25519 a, const bignum25519 b,
+                                                        bool &alt) {
+    const uint32_t s0 = a[0], s1 = a[1], s2 = a[2], s3 = a[3], s4 = a[4],
+                   s5 = a[5], s6 = a[6], s7 = a[7], s8 = a[8], s9 = a[9];
+    const uint32_t r0 = b[0], r1 = b[1], r2 = b[2], r3 = b[3], r4 = b[4],
+                   r5 = b[5], r6 = b[6], r7 = b[7], r8 = b[8], r9 = b[9];
+    const uint32_t r2_19 = r2 * 19, r4_19 = r4 * 19, r6_19 = r6 * 19, r8_19 = r8 * 19;
+    const uint32_t r1_38 = r1 * 38, r3_38 = r3 * 38, r5_38 = r5 * 38, r7_38 = r7 * 38,
+                   r9_38 = r9 * 38;
+    const uint32_t r1_2 = r1 * 2, r3_2 = r3 * 2, r5_2 = r5 * 2, r7_2 = r7 * 2;
+    uint32_t l0, h0, l8, h8, l9, h9;
+
+    MUL64_SET(l0, h0, s0, r0);
+    MUL64_ACC(l0, h0, s1, r9_38); MUL64_ACC(l0, h0, s2, r8_19); MUL64_ACC(l0, h0, s3, r7_38);
+    MUL64_ACC(l0, h0, s4, r6_19); MUL64_ACC(l0, h0, s5, r5_38); MUL64_ACC(l0, h0, s6, r4_19);
+    MUL64_ACC(l0, h0, s7, r3_38); MUL64_ACC(l0, h0, s8, r2_19); MUL64_ACC(l0, h0, s9, r1_38);
+
+    MUL64_SET(l8, h8, s0, r8);    MUL64_ACC(l8, h8, s1, r7_2);  MUL64_ACC(l8, h8, s2, r6);
+    MUL64_ACC(l8, h8, s3, r5_2);  MUL64_ACC(l8, h8, s4, r4);    MUL64_ACC(l8, h8, s5, r3_2);
+    MUL64_ACC(l8, h8, s6, r2);    MUL64_ACC(l8, h8, s7, r1_2);  MUL64_ACC(l8, h8, s8, r0);
+    MUL64_ACC(l8, h8, s9, r9_38);
+
+    MUL64_SET(l9, h9, s0, r9);    MUL64_ACC(l9, h9, s1, r8);    MUL64_ACC(l9, h9, s2, r7);
+    MUL64_ACC(l9, h9, s3, r6);    MUL64_ACC(l9, h9, s4, r5);    MUL64_ACC(l9, h9, s5, r4);
+    MUL64_ACC(l9, h9, s6, r3);    MUL64_ACC(l9, h9, s7, r2);    MUL64_ACC(l9, h9, s8, r1);
+    MUL64_ACC(l9, h9, s9, r0);
+
+    // Q ~ floor((m9 2^51 + m8 2^25) / 2^76) as nested floors.
+    const uint64_t u9 = MUL64_GET(l9, h9) + (MUL64_GET(l8, h8) >> 26);
+    const uint64_t q = u9 >> 25;
+    alt = ((uint32_t)u9 & 0x1FFFFFFu) >= 0x1FFFFFFu - 0x2000u;
+    return (uint32_t)(MUL64_GET(l0, h0) + 19 * q);
+}
+
+// -------------------------------------------------------------------------
 // Candidate filters. Each answers one question about the low 64 bits of the
 // compressed key (pub[0] in the low byte), and the search kernel takes the
 // filter as a template parameter, so every search mode is its own kernel: the
@@ -199,6 +326,9 @@ struct FilterOne {
     __device__ __forceinline__ bool operator()(uint64_t lo) const {
         return ((lo ^ req8) & mask8) == 0;
     }
+    __device__ __forceinline__ bool pre(uint32_t lo) const {
+        return ((lo ^ (uint32_t)req8) & (uint32_t)mask8 & 0x3FFFFFFu) == 0;
+    }
 };
 
 struct FilterList {
@@ -208,6 +338,11 @@ struct FilterList {
     __device__ __forceinline__ bool operator()(uint64_t lo) const {
         for (int j = 0; j < n; j++)
             if (((lo ^ req8[j]) & mask8[j]) == 0) return true;
+        return false;
+    }
+    __device__ __forceinline__ bool pre(uint32_t lo) const {
+        for (int j = 0; j < n; j++)
+            if (((lo ^ (uint32_t)req8[j]) & (uint32_t)mask8[j] & 0x3FFFFFFu) == 0) return true;
         return false;
     }
 };
@@ -230,12 +365,21 @@ struct FilterRepeat {
             hit |= ((lo ^ ((lo & unit[k]) * mult[k])) & mask[k]) == 0;
         return hit;
     }
+    __device__ __forceinline__ bool pre(uint32_t lo) const {
+        bool hit = false;
+#pragma unroll
+        for (int k = 0; k < K; k++)
+            hit |= ((lo ^ ((lo & (uint32_t)unit[k]) * (uint32_t)mult[k])) & (uint32_t)mask[k]
+                    & 0x3FFFFFFu) == 0;
+        return hit;
+    }
 };
 
 template <class A, class B>
 struct FilterEither {
     A a; B b;
     __device__ __forceinline__ bool operator()(uint64_t lo) const { return a(lo) || b(lo); }
+    __device__ __forceinline__ bool pre(uint32_t lo) const { return a.pre(lo) || b.pre(lo); }
 };
 
 // -------------------------------------------------------------------------
@@ -259,6 +403,9 @@ struct FilterEither {
 // w0/(r0 -/+ t). Per PAIR that is 8 multiplies: 1 forward (prefix product),
 // 2 backward (prefix inverse, strip), E*z, 2 splits and the 2 final products —
 // against 11 multiplies + 2 squarings for the complete formula it replaces.
+// The final products only feed the filter, so they are never formed: 30 of
+// their 100 partial products decide nearly every candidate (mul_key_lo26), and
+// the rare survivor gets 60 more (mul_key_lo64).
 //
 // If a denominator ever were zero, the whole window's inversion would come out
 // 0 and that thread would find nothing in it (no wrong key can come out: the
@@ -332,10 +479,27 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
     curve25519_square(R, r0);
 
     // Every y reaching the filter is a curve25519_mul output, as key_lo64 needs.
-    auto check_and_record = [&](const bignum25519 y, unsigned long long unit) {
-        if (!match(key_lo64(y))) return;
+    auto record = [&](unsigned long long unit) {
         unsigned long long slot = atomicAdd(out_count, 1ULL);
         if (slot < RESULT_CAP) out_units[slot] = unit;
+    };
+    auto check_and_record = [&](const bignum25519 y, unsigned long long unit) {
+        if (match(key_lo64(y))) record(unit);
+    };
+    // The same for y = n * d, without forming y (see mul_key_lo64).
+    auto check_product = [&](const bignum25519 n, const bignum25519 d, unsigned long long unit) {
+#ifdef VANITY_FULL_FINAL_MUL
+        bignum25519 y;
+        curve25519_mul(y, n, d);
+        check_and_record(y, unit);
+#else
+        bool alt;
+        const uint32_t lo26 = mul_key_lo26(n, d, alt);
+        if (match.pre(lo26) || (alt && match.pre(lo26 + 19))) {
+            const uint64_t lo = mul_key_lo64(n, d, alt);
+            if (match(lo) || (alt && match(lo + 19))) record(unit);
+        }
+#endif
     };
 
     // The centre candidate needs no table entry and no inversion: y = y0.
@@ -381,7 +545,7 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
     curve25519_mul(acc, acc, w0);                      // ... times w0, for every slot
 
     for (int i = H; i >= 1; i--) {
-        bignum25519 invprod, prod, a, d, n, y;
+        bignum25519 invprod, prod, a, d, n;
         curve25519_mul(invprod, acc, pref[i - 1]);     // w0 / ((r0 - t)(r0 + t))
         curve25519_sub(prod, R, ts[i]);
         curve25519_mul(acc, acc, prod);                // strip this pair
@@ -391,8 +555,7 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
         curve25519_sub(d, r0, tt[i]);
         curve25519_mul(d, d, invprod);
         curve25519_add(n, a, tx[i]);
-        curve25519_mul(y, n, d);
-        check_and_record(y, centre_unit - (unsigned long long)i);
+        check_product(n, d, centre_unit - (unsigned long long)i);
 
         // centre + 8i : y = w0 (E z - x) / (r0 - t),  w0/(r0 - t) = (r0 + t) * invprod.
         // i == H would land on the next window's first unit, so skip it — the
@@ -401,8 +564,7 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
             curve25519_add(d, r0, tt[i]);
             curve25519_mul(d, d, invprod);
             curve25519_sub(n, a, tx[i]);
-            curve25519_mul(y, n, d);
-            check_and_record(y, centre_unit + (unsigned long long)i);
+            check_product(n, d, centre_unit + (unsigned long long)i);
         }
     }
 
@@ -430,6 +592,42 @@ __global__ __launch_bounds__(VANITY_MAX_TPB) void vanity_kernel(
 // Selftest helper: multiply, then pack the product both ways, so the host can
 // check the filter's shortcut against donna's full 32-byte contract.
 // -------------------------------------------------------------------------
+// Selftest helper: the partial final products against the full multiply on
+// random operands shaped like the search kernel's — a is an unreduced add or a
+// partially carried sub of multiply outputs, b a multiply output. Counts:
+// [0] tested, [1] lo64 mismatches, [2] lo26 mismatches, [3] lo26 flagged
+// ambiguous, [4] of those, the ones that really needed Q + 1.
+__device__ static uint32_t test_rng(uint64_t &s) {
+    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (uint32_t)(s >> 32);
+}
+__device__ static void test_fe(bignum25519 f, uint64_t &s) {
+    for (int k = 0; k < 10; k++) f[k] = test_rng(s) & ((k & 1) ? 0x1ffffffu : 0x3ffffffu);
+}
+__global__ void partial_mul_kernel(unsigned long long *cnt, int per, unsigned long long seed) {
+    uint64_t s = seed ^ (0x9E3779B97F4A7C15ULL * (blockIdx.x * blockDim.x + threadIdx.x + 1));
+    unsigned long long c[5] = {0, 0, 0, 0, 0};
+    for (int it = 0; it < per; it++) {
+        bignum25519 u, v, w, x, d, n, y;
+        test_fe(u, s); test_fe(v, s); test_fe(w, s); test_fe(x, s);
+        curve25519_mul(d, u, v);
+        curve25519_mul(w, w, x);
+        test_fe(x, s);
+        if (it & 1) curve25519_add(n, w, x);
+        else        curve25519_sub(n, w, x);
+        curve25519_mul(y, n, d);
+        const uint64_t full = key_lo64(y);
+        bool alt;
+        const uint64_t lo = mul_key_lo64(n, d, alt);
+        c[0]++;
+        if (!(lo == full || (alt && lo + 19 == full))) c[1]++;
+        const uint32_t p26 = mul_key_lo26(n, d, alt) & 0x3FFFFFFu, f26 = (uint32_t)full & 0x3FFFFFFu;
+        if (alt) { c[3]++; if (p26 != f26) c[4]++; }
+        if (!(p26 == f26 || (alt && ((p26 + 19) & 0x3FFFFFFu) == f26))) c[2]++;
+    }
+    for (int k = 0; k < 5; k++) atomicAdd(&cnt[k], c[k]);
+}
+
 __global__ void mul_lo64_kernel(const bignum25519 *__restrict__ a, const bignum25519 *__restrict__ b,
                                 int n, uint8_t *__restrict__ out32,
                                 unsigned long long *__restrict__ out_lo) {
@@ -439,6 +637,14 @@ __global__ void mul_lo64_kernel(const bignum25519 *__restrict__ a, const bignum2
     curve25519_mul(m, a[i], b[i]);
     curve25519_contract(out32 + i * 32, m);
     out_lo[i] = key_lo64(m);
+    // The search kernel's shortcuts must agree with the full multiply: the same
+    // value, or (flagged) 19 less. Report a disagreement as an impossible value.
+    const uint64_t full = out_lo[i];
+    bool alt;
+    const uint64_t part = mul_key_lo64(a[i], b[i], alt);
+    if (!(part == full || (alt && part + 19 == full))) out_lo[i] = ~full;
+    const uint32_t p26 = mul_key_lo26(a[i], b[i], alt) & 0x3FFFFFFu, f26 = (uint32_t)full & 0x3FFFFFFu;
+    if (!(p26 == f26 || (alt && ((p26 + 19) & 0x3FFFFFFu) == f26))) out_lo[i] = ~full;
 }
 
 // Host-callable single-key pack: full compressed pubkey (incl. parity) for a
@@ -1411,6 +1617,24 @@ struct Rig {
 // multiply can leave y + p. Real candidates hit that with probability ~2^-203;
 // here the inputs = 0 mod p and the other edge cases produce it on purpose.
 // -------------------------------------------------------------------------
+static int check_partial_products() {
+    unsigned long long *d_cnt, h[5];
+    cuda_check(cudaMalloc(&d_cnt, sizeof h), "malloc partial cnt");
+    cuda_check(cudaMemset(d_cnt, 0, sizeof h), "memset partial cnt");
+    unsigned long long seed = 0;
+    fill_random((uint8_t *)&seed, sizeof seed);
+    partial_mul_kernel<<<256, 256>>>(d_cnt, 256, seed);
+    cuda_check(cudaGetLastError(), "partial launch");
+    cuda_check(cudaDeviceSynchronize(), "partial sync");
+    cuda_check(cudaMemcpy(h, d_cnt, sizeof h, cudaMemcpyDeviceToHost), "copy partial cnt");
+    cudaFree(d_cnt);
+    const unsigned long long bad = h[1] + h[2];
+    printf("[selftest] partial final products == full multiply on %llu kernel-shaped products: %s"
+           " (%llu ambiguous 26-bit cases, %llu needing Q+1)\n",
+           h[0], bad ? "BROKEN" : "exact", h[3], h[4]);
+    return bad ? 1 : 0;
+}
+
 static int check_key_lo64() {
     const uint32_t m26 = (1u << 26) - 1, m25 = (1u << 25) - 1;
     typedef std::array<uint32_t, 10> Fe;
@@ -1458,7 +1682,7 @@ static int check_key_lo64() {
         for (int b = 8; b < 32; b++) tiny = tiny && c[b] == 0;
         if (tiny) small++; else fails++;
     }
-    printf("[selftest] filter bits == low 8 bytes of contract: %d/%d products ok"
+    printf("[selftest] filter bits (full and partial multiply) == low 8 bytes of contract: %d/%d products ok"
            " (+%d forced y < 2^52 left as y + p, the documented miss)\n",
            n - fails - small, n, small);
     return fails;
@@ -1751,6 +1975,7 @@ static int run_selftest() {
     fails += !kat_ok;
 
     fails += check_key_lo64();
+    fails += check_partial_products();
     fails += check_probability();
     // A power-of-two window, a "half" window, and >1 thread so the boundary
     // between neighbouring spans is actually exercised.

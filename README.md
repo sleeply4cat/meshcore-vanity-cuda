@@ -64,33 +64,34 @@ waves for the best pair, and prints the options to use:
 $ ./meshcore-vanity --benchmark
 Benchmarking NVIDIA GeForce RTX 3050 Laptop GPU (16 SM), ~1 minute...
 window     Mkeys/s   loc/thr    reserve   (tpb 128, 32 waves)
-    64       696.7       1KB      37MB
+    64       762.7       1KB      36MB
   ...
-  2048      1103.8      40KB     967MB
-  3072      1112.9      60KB    1447MB
-  4096      1111.0      80KB    1927MB
-  6144      1112.4     120KB    2887MB
-  8192    OOM/skip     160KB    3847MB
+  1024      1234.2      20KB     486MB
+  1536      1242.3      30KB     726MB
+  2048      1260.4      40KB     966MB
+  3072      1235.7      60KB    1446MB
+  4096      1258.4      80KB    1926MB
+  6144      1242.7     120KB    2886MB
+  8192    OOM/skip     160KB    3846MB
   ...
   window     tpb   blocks     Mkeys/s   (32 waves)
-    3072      64     3072      1103.7
-    3072     128     1536      1112.9
-    3072     256      512      1026.4
-    3072     384      512      1090.4
+    2048      64     3072      1244.6
+    2048     128     1536      1260.4
+    2048     256      512      1206.4
+    2048     384      512      1235.7
   ...
   window     tpb   waves   blocks     Mkeys/s
-    3072     128       8      384      1099.9
-    3072     128      16      768      1102.5
-    3072     128      32     1536      1112.9
-    3072     128      64     3072      1100.5
+    2048     128       8      384      1253.1
+    2048     128      16      768      1252.3
+    2048     128      32     1536      1260.4
+    2048     128      64     3072      1246.4
 
-Fastest: --window 3072 --tpb 128 --blocks 1536  (1112.9 Mkeys/s)
+Fastest: --window 2048 --tpb 128 --blocks 1536  (1260.4 Mkeys/s)
 Differences under ~1% are within run-to-run noise.
 ```
 
-Here the defaults already run at 1104 Mkeys/s, within 1% of the best. Why the
-block size and the grid matter at all is explained under
-[Block size and grid](#block-size-and-grid---tpb---blocks).
+Here the best is exactly the defaults. Why the block size and the grid matter
+at all is explained under [Block size and grid](#block-size-and-grid---tpb---blocks).
 
 Output is a 64-hex public key and a 128-hex private key (32-byte scalar +
 32-byte random signing component), matching the MeshCore format.
@@ -293,9 +294,50 @@ a few bits over, so the value it returns is below `2²⁵⁵ + 2⁵²` and its l
 bytes are just `f0 + f1·2²⁶ + f2·2⁵¹`: no canonical reduction, no packing. That
 value is the canonical `y` unless it lies in `[p, 2²⁵⁵ + 2⁵²)`, i.e. unless
 `y < 2⁵² + 19` — a 2⁻²⁰³ chance per candidate, in which case a match would be
-missed, never a false one reported. Every `y` the kernel filters is a multiply
-output, so this holds throughout. (Doing the full `contract` reduction first
+missed, never a false one reported. (Doing the full `contract` reduction first
 costs ~4% of throughput.)
+
+### Never forming the last product
+
+Each candidate's `y` is the last multiply of its pair, `y = n·d`, and it is used
+for nothing but the filter — so it is never formed. Write the product's ten
+columns (before any carry) as `m0…m9`, at bit offsets `0, 26, 51, 77, …, 230`.
+The multiply's carry chain turns them into `S mod 2²⁵⁵` plus `19·Q` folded into
+limb 0, `Q = ⌊S / 2²⁵⁵⌋`, so
+
+```
+low 64 bits of y  = (m0 + m1·2²⁶ + m2·2⁵¹ + 19·Q)  mod 2⁶⁴
+low 26 bits of y  = (m0 + 19·Q)                    mod 2²⁶
+```
+
+and `Q` is fixed by the top columns: the ones below `m7` move `S / 2²⁵⁵` by less
+than 2⁻³⁹, so `m7…m9` give it exactly unless the value sits within 2⁻³⁸ of an
+integer, and `m8, m9` alone give it unless it sits within 2⁻¹² of one. In those
+flagged cases `Q` may be one larger, and both `y` and `y + 19` are tested (the
+host re-derives every hit, so an extra candidate costs only a check).
+
+The filter runs in two stages on that basis:
+
+1. **26 bits from 30 products** — columns `m0, m8, m9`, 30 of the 100 partial
+   products. Any criterion of 7+ hex digits rejects all but ~2⁻²⁴ of the
+   candidates here (for a prefix, a list or a repeat rule alike: each filter
+   also has a 26-bit form).
+2. **64 bits from 60 products** — `m0, m1, m2, m7, m8, m9`, for the rare
+   survivor, then the usual full test.
+
+Stage 2 alone (the first version of this) was worth ~6–8%; stage 1 in front of
+it another ~7%; together **+14%** on an RTX 3050 (1099 → 1259 Mkeys/s),
++12–14% with prefix lists and repeat rules. `make EXTRA=-DVANITY_FULL_FINAL_MUL`
+builds the old full final multiply for A/B runs.
+
+Things that did **not** help, measured on the same GPU: moving the ×19/×38/×2
+constant multiplies from IMAD to shifts and adds on the ALU pipe (−2.5% — the
+kernel is bound by instruction issue and latency more than by the IMAD pipe
+itself, so shifting work between pipes loses if it adds instructions), keeping
+pre-scaled copies of table operands (±0), capping registers at 128 for 16 warps
+per SM instead of 12 (−11%, spills), unrolling the backward loop by two pairs
+(−3%), and — measured earlier — a 2³²-radix multiply with carry chains (the
+`mad.cc` chain runs 2.3× slower per product than `IMAD.WIDE`).
 
 The prefix itself is packed host-side into one `req`/`mask` pair of 64-bit
 words, so the test is a single `(y ^ req) & mask` instead of a loop over a
@@ -461,7 +503,11 @@ defaults run the RTX 5060 Ti at ~5.9 Gkeys/s instead of 4.46.
    low 64 bits must agree with donna's full 32-byte `contract` for products of
    random field elements and of the edge cases (`0`, `1`, `p−1`, `p`, `p+1`,
    `2²⁵⁵−1`); the only allowed difference is the documented `y < 2⁵²` miss,
-   which the edge cases trigger on purpose.
+   which the edge cases trigger on purpose. Both partial final products (26 and
+   64 bits) must agree with the full multiply there too, and on 16.8 million
+   random products shaped like the kernel's (unreduced sums and differences
+   times multiply outputs), where the ambiguous 26-bit case comes up thousands
+   of times.
 4. **Ground truth** — every candidate of a small grid is recomputed
    independently (full fixed-base scalar multiplication, projective, packed by
    donna), and the set whose key has a given hex digit must be exactly what the

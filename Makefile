@@ -7,7 +7,10 @@ ARCH    ?= sm_86
 GENCODE ?= -arch=$(ARCH)
 # The batch window is chosen at runtime (--window, or auto-fit to VRAM); no
 # compile-time knob needed. Integer math only (no --use_fast_math).
-NVFLAGS := -O3 $(GENCODE) -lineinfo -Xptxas -O3 --std=c++14
+# EXTRA: extra nvcc flags, e.g. EXTRA=-DVANITY_FULL_FINAL_MUL for an A/B build
+# that forms the final products in full instead of filtering on part of them.
+EXTRA   ?=
+NVFLAGS := -O3 $(GENCODE) -lineinfo -Xptxas -O3 --std=c++14 $(EXTRA)
 
 BIN := meshcore-vanity
 
