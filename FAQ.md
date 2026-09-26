@@ -14,13 +14,22 @@ being printed, and the math is cross-validated against libsodium/PyNaCl (see
 [README → Correctness](README.md#correctness)).
 
 ### Do I need a GPU? Which one?
-Yes — it's GPU-only, there is no CPU search path. Any NVIDIA GPU with a recent
-driver works. The released binary is a fat binary with native code for
-sm_60…sm_90 and sm_120 (RTX 50) plus PTX fallbacks, so it runs on other
-generations too. A GPU without native code in it gets the PTX compiled by the
-driver on the first run, which takes a few minutes for this program (3m15s on
-an RTX 5060 Ti from the sm_90 PTX) and is cached afterwards. Build from source
-with `make ARCH=sm_XX` for your specific card.
+Yes — it's GPU-only, there is no CPU search path. Any NVIDIA GPU from Pascal
+(GTX 10xx) on works. There are two release variants:
+
+- **full**: native code for sm_60…sm_90 and sm_120 (RTX 50), plus PTX for newer
+  GPUs, so it starts at once on any listed GPU.
+- **slim**: PTX only, a fraction of the download. The driver compiles it for
+  your GPU on the first run, which takes a few minutes (4m47s on a laptop,
+  3m15s on a desktop) and a couple of GB of RAM; the program prints
+  "Compiling GPU code..." with a running count meanwhile. The result is cached,
+  so later runs start at once. Needs a driver as new as the CUDA it was built
+  with (R575+ for the releases); an older one gets a message saying so. The
+  code is then only as good as the compiler in your driver: 2.3% slower than
+  the full build on an RTX 3050 Laptop with driver 595.
+
+The full build treats a GPU newer than its native code the same way. Build
+from source with `make ARCH=sm_XX` for your specific card.
 
 ### How fast is it?
 Over a billion keys per second on a modern NVIDIA GPU (~1.25 Gkeys/s on a

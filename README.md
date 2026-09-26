@@ -26,14 +26,33 @@ faster (see [How it works](#how-it-works)).
 ```bash
 make                      # build for your GPU (default sm_86)
 make ARCH=sm_75           # build for a specific architecture
-make release              # portable fat binary (sm_60…sm_120 + PTX fallback)
+make release              # full: machine code for sm_60…sm_120 + PTX fallback
+make release-slim         # slim: PTX only, compiled on the user's machine
 ```
 
 Requires the CUDA toolkit (tested with 12.0+; `make release` needs 12.8+ for
 RTX 50 / sm_120) and an NVIDIA GPU. The batch
 window is a **runtime** option (see below), so one binary runs on any GPU — no
-per-machine rebuild. `make release` produces a single binary that runs across
-GPU generations.
+per-machine rebuild.
+
+Releases come in two variants, both single binaries that run across GPU
+generations:
+
+- **full** (`meshcore-vanity-*`, ~150 MB): machine code for every generation
+  from Pascal to Blackwell, plus PTX for GPUs newer than that. Starts at once
+  on any listed GPU.
+- **slim** (`meshcore-vanity-slim-*`, ~11 MB): no machine code, only PTX. The
+  NVIDIA driver compiles it for your GPU on the first run — 4–5 minutes and
+  ~2.5 GB of RAM on a laptop; the program says so while it waits — and caches
+  the result (`~/.nv/ComputeCache`, `%APPDATA%\NVIDIA\ComputeCache`), so
+  later runs start at once. Needs a driver at least as new as the CUDA it was
+  built with (R575+ for the releases, built with CUDA 12.9). The machine code
+  then comes from the compiler inside your driver rather than the one the full
+  build was made and measured with: on an RTX 3050 Laptop (driver 595) it ran
+  2.3% slower than the full build.
+
+A GPU the full build has no machine code for (a newer generation) gets the
+same one-time compile from its PTX.
 
 ## Usage
 
@@ -552,7 +571,7 @@ result could never produce output.
 |---|---|
 | `src/ed25519.cuh` | Ed25519 field + group arithmetic (radix 2²⁵·⁵), fixed-base comb, pack. Derived from ed25519-donna (public domain). |
 | `src/main.cu` | Step-table precompute kernel, the affine batched-addition search kernel, self-tests, and the host CLI/driver. |
-| `Makefile` | `nvcc` build; `make release` builds a portable multi-arch fat binary. |
+| `Makefile` | `nvcc` build; `make release` / `make release-slim` build the two portable release variants. |
 
 ## License
 

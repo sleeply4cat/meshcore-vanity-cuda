@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <random>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #ifdef _WIN32
 // Declared by hand rather than through <windows.h>/<bcrypt.h>, whose macros
@@ -1145,6 +1148,72 @@ static int nearest_window(int req) {
     return kWindows[sizeof(kWindows) / sizeof(kWindows[0]) - 1];
 }
 
+// Select the device and load the GPU code. A binary without machine code (SASS)
+// for this GPU (the slim build, which ships PTX only, or a GPU newer than any
+// SASS in the full one) has the driver compile the PTX when the code is first
+// loaded, all kernels at once: minutes and a few GB of RAM for this program
+// (4m47s on a laptop, 3m15s on a desktop), after which the driver's disk cache
+// makes later runs start at once. Loading happens here, up front, and a load
+// that takes more than a few seconds can only be that compile, so a watcher
+// thread says what is going on instead of leaving a silent terminal.
+static void open_device(int dev, bool progress) {
+    using clock = std::chrono::steady_clock;
+    cudaDeviceProp prop;
+    cuda_check(cudaGetDeviceProperties(&prop, dev), "getDeviceProperties");
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false, told = false;
+    const auto t0 = clock::now();
+    auto secs = [&] { return std::chrono::duration<double>(clock::now() - t0).count(); };
+    std::thread watch([&] {
+        std::unique_lock<std::mutex> lk(m);
+        if (cv.wait_for(lk, std::chrono::seconds(3), [&] { return done; })) return;
+        told = true;
+        const char *nc = getenv("CUDA_CACHE_DISABLE");
+        fprintf(stderr, "Compiling GPU code for %s (sm_%d%d): this build has no ready-made "
+                        "code for it,\nso the driver compiles it from PTX. It takes a few minutes "
+                        "and a few GB of RAM, %s\n", prop.name, prop.major, prop.minor,
+                nc && atoi(nc) ? "and CUDA_CACHE_DISABLE is set, so every run repeats it."
+                               : "once: the result is cached for later runs.");
+        while (!cv.wait_for(lk, std::chrono::seconds(1), [&] { return done; }))
+            if (progress) fprintf(stderr, "\r  compiling... %.0f s", secs());
+        if (progress) fputc('\r', stderr);
+    });
+
+    // Under lazy loading (the default since CUDA 12.2) the first kernel lookup
+    // loads the module; under eager loading the context creation already did.
+    cudaError_t e = cudaSetDevice(dev);
+    // Block (sleep) the host thread while waiting on the GPU instead of the
+    // default busy-wait spin, which otherwise pegs one CPU core at 100% and
+    // eats into the shared laptop power/thermal budget (lowering GPU boost).
+    if (e == cudaSuccess) e = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    cudaFuncAttributes fa;
+    if (e == cudaSuccess) e = cudaFuncGetAttributes(&fa, build_step_table_kernel);
+    { std::lock_guard<std::mutex> lk(m); done = true; }
+    cv.notify_one();
+    watch.join();
+    if (told && e == cudaSuccess) fprintf(stderr, "GPU code ready after %.0f s.\n", secs());
+
+    if (e == cudaErrorUnsupportedPtxVersion) {
+        int drv = 0;
+        cudaDriverGetVersion(&drv);
+        fprintf(stderr, "This build has no ready-made code for %s (sm_%d%d), and its PTX is "
+                        "from CUDA %d.%d,\nwhich the installed driver (CUDA %d.%d) cannot compile. "
+                        "Update the NVIDIA driver, or build\nfrom source: make ARCH=sm_%d%d\n",
+                prop.name, prop.major, prop.minor, CUDART_VERSION / 1000,
+                CUDART_VERSION % 1000 / 10, drv / 1000, drv % 1000 / 10, prop.major, prop.minor);
+        exit(1);
+    }
+    if (e == cudaErrorNoKernelImageForDevice) {
+        fprintf(stderr, "This build has no code that runs on %s (sm_%d%d). Build from source "
+                        "for it:\nmake ARCH=sm_%d%d\n", prop.name, prop.major, prop.minor,
+                prop.major, prop.minor);
+        exit(1);
+    }
+    cuda_check(e, "opening the GPU");
+}
+
 static int run_selftest();
 static int run_benchmark();
 
@@ -1223,11 +1292,7 @@ int main(int argc, char **argv) {
     }
     if (tpb < 32) { fprintf(stderr, "Block size must be at least 32.\n"); return 1; }
 
-    cuda_check(cudaSetDevice(device), "setDevice");
-    // Block (sleep) the host thread while waiting on the GPU instead of the
-    // default busy-wait spin, which otherwise pegs one CPU core at 100% and
-    // eats into the shared laptop power/thermal budget (lowering GPU boost).
-    cuda_check(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), "setDeviceFlags");
+    open_device(device, progress);
 
     if (selftest) return run_selftest();
     if (benchmark) {

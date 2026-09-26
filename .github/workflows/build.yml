@@ -10,10 +10,12 @@ on:
 permissions:
   contents: write
 
-# Fat-binary codegen targets, shared by the Linux and Windows release builds.
-# (Linux goes through `make release`; keep that list in sync with this one.)
+# Codegen targets of the two release variants (see the Makefile), for the
+# Windows builds. Linux goes through `make release` / `make release-slim`;
+# keep GENCODE_FULL / GENCODE_SLIM there in sync with these.
 env:
-  GENCODE: >-
+  GENCODE_SLIM: -gencode arch=compute_60,code=compute_60
+  GENCODE_FULL: >-
     -gencode arch=compute_60,code=sm_60
     -gencode arch=compute_70,code=sm_70
     -gencode arch=compute_75,code=sm_75
@@ -43,9 +45,16 @@ jobs:
           ./meshcore-vanity --help
 
   # ---- Release builds, tags only ------------------------------------------
+  # Two variants: full = machine code for every generation, slim = PTX only,
+  # compiled by the driver on the user's machine on the first run.
   linux:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant: [full, slim]
+    env:
+      PKG: meshcore-vanity${{ matrix.variant == 'slim' && '-slim' || '' }}-linux-x86_64.tar.gz
     # ubuntu22.04 base keeps the binary portable to older distros (glibc 2.35).
     # CUDA 12.9: the last 12.x — sm_120 (RTX 50) SASS, and still sm_60/sm_70.
     container:
@@ -57,17 +66,22 @@ jobs:
       - name: Build portable binary
         run: |
           nvcc --version
-          make release
+          make ${{ matrix.variant == 'slim' && 'release-slim' || 'release' }}
           ./meshcore-vanity --help
-          tar czf meshcore-vanity-linux-x86_64.tar.gz meshcore-vanity README.md FAQ.md LICENSE
+          tar czf $PKG meshcore-vanity README.md FAQ.md LICENSE
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
-          path: meshcore-vanity-linux-x86_64.tar.gz
+          name: linux-${{ matrix.variant }}
+          path: ${{ env.PKG }}
 
   windows:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: windows-2022        # VS2022 / MSVC preinstalled
+    strategy:
+      matrix:
+        variant: [full, slim]
+    env:
+      PKG: meshcore-vanity${{ matrix.variant == 'slim' && '-slim' || '' }}-windows-x86_64.zip
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit
@@ -79,17 +93,19 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
       - name: Build portable binary
         shell: cmd
+        env:        # step level: a job's env cannot read the workflow's
+          GENCODE: ${{ matrix.variant == 'slim' && env.GENCODE_SLIM || env.GENCODE_FULL }}
         run: |
           nvcc --version
           nvcc -O3 -Xptxas -O3 --std=c++14 -Xcompiler "/MT" %GENCODE% src\main.cu -o meshcore-vanity.exe
           meshcore-vanity.exe --help
       - name: Package
         shell: pwsh
-        run: Compress-Archive -Path meshcore-vanity.exe,README.md,FAQ.md,LICENSE -DestinationPath meshcore-vanity-windows-x86_64.zip
+        run: Compress-Archive -Path meshcore-vanity.exe,README.md,FAQ.md,LICENSE -DestinationPath $env:PKG
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
-          path: meshcore-vanity-windows-x86_64.zip
+          name: windows-${{ matrix.variant }}
+          path: ${{ env.PKG }}
 
   release:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
